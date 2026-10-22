@@ -957,6 +957,7 @@ int main(int argc, char **argv) {
 		} else
 			dirty = 1;
 		if (quit_flag) break;
+		pipeline_tick();
 		if (need_render) pipeline_render();
 		ui_frame();
 		frame_end();

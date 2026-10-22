@@ -720,3 +720,10 @@ static void draw_canvas(void) {
 	}
 	clip_set(cc);
 }
+
+/* a value is being dragged (slider or on-canvas scrub): render on the half-size proxy meanwhile */
+static int g_force_lo = 0; /* benchmark hook */
+static int interacting_now(void) { return g_force_lo || (m_down[0] && (act_id != 0 || cdrag == 3)); }
+static void pipeline_tick(void) {
+	if (lo_shown && !interacting_now()) need_render = 1; /* drag ended: do the full-quality render */
+}

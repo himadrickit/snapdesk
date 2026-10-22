@@ -8,6 +8,7 @@ typedef struct {
 	uint8_t *rgb; /* source pixels, EXIF-oriented, RGB8 */
 	int w, h;
 	Img proxy; /* float preview-resolution copy of the source */
+	Img proxy_lo; /* half-size copy used while a slider / scrub is being dragged */
 	int proxy_max;
 	uint32_t proxy_gen;
 	int loaded;
@@ -110,6 +111,13 @@ static void compute_histogram(const Mips *m) {
 /* ---- the render pipeline with prefix cache ---- */
 static Img pf, out;
 static int pf_ok = 0, pf_k = -1, out_ok = 0;
+/* drag-time quick preview: the same stack rendered on a half-size proxy, then upscaled */
+static Img pfL, outL;
+static int pfL_ok = 0, pfL_k = -1, outL_ok = 0, lo_shown = 0;
+static uint64_t pfL_sig = 0, outL_sig = 0;
+static int interacting_now(void);
+static double full_ms = 0; /* cost of the last full-quality render: the quick preview is only used when it is high */
+static long proxy_lo_min = 600000; /* only bother with the quick preview above this many preview pixels */
 static uint64_t pf_sig = 0, out_sig = 0;
 static int need_render = 1;
 
@@ -138,15 +146,59 @@ static uint64_t stack_sig(int K) {
 static void pipeline_invalidate(void) {
 	pf_ok = 0;
 	out_ok = 0;
+	pfL_ok = 0;
+	outL_ok = 0;
 	need_render = 1;
 }
 static double now_ms(void) { return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(); }
 
+static void pipeline_render_lo(int n, int K) {
+	uint64_t sigK = stack_sig(K);
+	if (!(pfL_ok && pfL_k == K && pfL_sig == sigK)) {
+		if (outL_ok && K == n && outL_sig == sigK)
+			img_assign(&pfL, &outL);
+		else {
+			img_assign(&pfL, &doc.proxy_lo);
+			for (int i = 0; i < K; i++)
+				if (eff_visible(i)) apply_layer(&stack[i], &pfL);
+		}
+		pfL_k = K;
+		pfL_sig = sigK;
+		pfL_ok = 1;
+	}
+	uint64_t sigN = stack_sig(n);
+	if (!(outL_ok && outL_sig == sigN)) {
+		img_assign(&outL, &pfL);
+		for (int i = K; i < n; i++)
+			if (eff_visible(i)) apply_layer(&stack[i], &outL);
+		outL_sig = sigN;
+		outL_ok = 1;
+	}
+	/* upscale to exactly the size the full-quality render will have, so the view does not jump */
+	int ew = doc.proxy.w, eh = doc.proxy.h;
+	for (int i = 0; i < n; i++)
+		if (eff_visible(i)) layer_outdims(&stack[i], &ew, &eh);
+	Img up = (outL.w == ew && outL.h == eh) ? img_clone(&outL) : resize_f(&outL, ew, eh);
+	img_free(&out);
+	out = up;
+	out_ok = 0; /* `out` is not full quality now */
+	lo_shown = 1;
+	mips_from_img(&disp, &out);
+	compute_histogram(&disp);
+	render_serial++;
+}
 static void pipeline_render(void) {
 	if (!doc.loaded) return;
 	double t0 = now_ms();
 	int n = nlayers;
 	int K = active >= 0 ? active : n;
+	if (doc.proxy_lo.p && full_ms > 45.0 && interacting_now()) {
+		pipeline_render_lo(n, K);
+		need_render = 0;
+		last_render_ms = now_ms() - t0;
+		return;
+	}
+	lo_shown = 0;
 	uint64_t sigK = stack_sig(K);
 	if (!(pf_ok && pf_k == K && pf_sig == sigK)) {
 		if (out_ok && K == n && out_sig == sigK)
@@ -173,6 +225,7 @@ static void pipeline_render(void) {
 	}
 	need_render = 0;
 	last_render_ms = now_ms() - t0;
+	full_ms = last_render_ms;
 }
 
 /* final size of the exported image (computed from the stack, no pixels touched) */
@@ -620,6 +673,8 @@ static void proxy_build(void) {
 		th = MAX(1, (int)(doc.h * s + 0.5f));
 	}
 	doc.proxy = resize_u8(doc.rgb, doc.w, doc.h, tw, th);
+	img_free(&doc.proxy_lo);
+	if ((long)tw * th > proxy_lo_min) doc.proxy_lo = resize_f(&doc.proxy, MAX(1, (tw + 1) / 2), MAX(1, (th + 1) / 2));
 	doc.proxy_gen++;
 	mips_from_img(&odisp, &doc.proxy);
 	pipeline_invalidate();

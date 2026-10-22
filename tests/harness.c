@@ -7,6 +7,7 @@ static int fails = 0, checks = 0;
 #define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("  FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static void frame(void) {
+	pipeline_tick();
 	if (need_render) pipeline_render();
 	ui_frame();
 	frame_end();
@@ -56,6 +57,7 @@ int main(int argc, char **argv) {
 	SDL_Init(SDL_INIT_TIMER | SDL_INIT_EVENTS);
 	init_luts(); fonts_init(); pool_init();
 	doc.proxy_max = PROXY_DEFAULT;
+	proxy_lo_min = 200000; full_ms = 1e9;
 	FW = 1440; FH = 900; fb = (uint32_t *)xcalloc((size_t)FW * FH, 4);
 	const char *img = argc > 1 ? argv[1] : "/home/claude/testimg/building.jpg";
 	frame();
@@ -457,6 +459,42 @@ int main(int argc, char **argv) {
 		do_undo();
 		CHECK(nlayers > 0 || nl0 == 0, "revert is undoable");
 		(void)nl0;
+	}
+
+	printf("[drag-time quick preview]\n");
+	if (doc.proxy_lo.p) {
+		edit_end(0);
+		int base_n = nlayers;
+		select_tool(T_TUNE);
+		int cx_ = cvx + cvw / 2, cy_ = cvy + cvh / 2;
+		move(cx_, cy_);
+		press(0);
+		for (int i = 1; i <= 6; i++) move(cx_ + i * 12, cy_ + 1);
+		CHECK(lo_shown, "dragging renders on the half-size proxy");
+		int lw = out.w, lh = out.h;
+		{ int ew = doc.proxy.w, eh = doc.proxy.h; for (int i = 0; i < nlayers; i++) if (eff_visible(i)) layer_outdims(&stack[i], &ew, &eh);
+		CHECK(lw == ew && lh == eh, "quick preview has the full-render size (%dx%d vs %dx%d)", lw, lh, ew, eh); }
+		float v_mid = stack[active].p[sel_param];
+		release(0);
+		CHECK(!lo_shown && out_ok, "release does the full-quality render");
+		CHECK(out.w == lw && out.h == lh, "size does not jump on release");
+		CHECK(ref_diff() < 1e-4 || active >= 0, "settled render matches a fresh render (%.3g)", ref_diff());
+		(void)v_mid;
+		edit_end(1);
+		CHECK(ref_diff() < 1e-4, "committed render equals fresh render (%.3g)", ref_diff());
+		/* geometry layers: expected size must match what the full render produces */
+		{ Layer *g = &stack[nlayers]; layer_init(g, T_CROP); g->cr[0] = 0.1f; g->cr[2] = 0.8f; g->touched = 1; g->visible = 1; layer_bump(g); nlayers++;
+		  g = &stack[nlayers]; layer_init(g, T_FRAME); g->p[FR_WIDTH] = 30; g->p[FR_STYLE] = 1; g->touched = 1; g->visible = 1; layer_bump(g); nlayers++;
+		  need_render = 1; frame(); }
+		select_tool(T_TUNE);
+		move(cx_, cy_); press(0);
+		for (int i = 1; i <= 4; i++) move(cx_ + i * 10, cy_ + 1);
+		int mw = out.w, mh = out.h; int was_lo = lo_shown;
+		release(0);
+		CHECK(was_lo && out.w == mw && out.h == mh, "geometry stack: size %dx%d -> %dx%d", mw, mh, out.w, out.h);
+		edit_end(0);
+		while (nlayers > base_n) layer_remove(nlayers - 1);
+		need_render = 1; frame();
 	}
 
 	printf("[export]\n");

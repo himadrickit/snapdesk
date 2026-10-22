@@ -48,3 +48,4 @@ Effects: Bloom (soft highlight glow), Halation (red film glow, Z), Double Exposu
 - **Save Look** (edit stack header): stores the visible layers as your own Look at the end of the Looks strip; right-click one to delete. Saved to the per-user pref folder (looks.txt). Geometry, brush, heal, selective, text and masked layers are not stored.
 - **Revert** (undoable), **Info** (image details), **tool search** (Ctrl+F, Enter opens the first match) and **All / Refine / Fix / Style** tabs in the tool list.
 - Drop an image on the window while Double Exposure is open to use it as the second photo.
+- **Speed**: built with -O3; while you drag a slider or scrub on a big photo, heavy tools render on a half-size copy and the full-quality render happens when you let go (only kicks in when a render takes over ~45 ms).
