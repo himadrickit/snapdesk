@@ -20,6 +20,7 @@ static int cx0_ = 0, cy0_ = 0, cx1_ = 0, cy1_ = 0; /* clip rect [x0,x1) [y0,y1) 
 #define C_G_RET 0xf2a03d
 #define C_G_FIL 0xb77cf0
 
+static int ui_dry = 0; /* input-only pass: layout and widget logic run, nothing is drawn (the clip is empty) */
 typedef struct { int x0, y0, x1, y1; } Clip;
 static Clip clip_get(void) { Clip c = {cx0_, cy0_, cx1_, cy1_}; return c; }
 static void clip_set(Clip c) { cx0_ = c.x0; cy0_ = c.y0; cx1_ = c.x1; cy1_ = c.y1; }
@@ -50,6 +51,7 @@ static inline void put_px(int x, int y, uint32_t c, int a) {
 static inline int a256(float alpha) { return (int)(CL01(alpha) * 256.f + 0.5f); }
 
 static void fill_rect(int x, int y, int w, int h, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int x0 = MAX(x, cx0_), y0 = MAX(y, cy0_), x1 = MIN(x + w, cx1_), y1 = MIN(y + h, cy1_);
 	int a = a256(alpha);
 	if (a <= 0) return;
@@ -73,28 +75,61 @@ static float sdf_rr(float px, float py, float cx, float cy, float hw, float hh, 
 	return sqrtf(ox * ox + oy * oy) + MIN(MAX(qx, qy), 0.f) - r;
 }
 static void rrect(float x, float y, float w, float h, float r, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int x0 = MAX((int)floorf(x), cx0_), y0 = MAX((int)floorf(y), cy0_), x1 = MIN((int)ceilf(x + w), cx1_), y1 = MIN((int)ceilf(y + h), cy1_);
 	float cx = x + w * 0.5f, cy = y + h * 0.5f, hw = w * 0.5f, hh = h * 0.5f;
 	r = MIN(r, MIN(hw, hh));
-	for (int j = y0; j < y1; j++)
-		for (int i = x0; i < x1; i++) {
-			float d = sdf_rr(i + 0.5f, j + 0.5f, cx, cy, hw, hh, r);
-			float cov = CL01(0.5f - d);
+	int aa = a256(alpha);
+	/* rows in the straight band: the interior is fully covered, only the 1-2 edge pixels need the SDF */
+	int xs = (int)ceilf(x), xe = (int)floorf(x + w);
+	for (int j = y0; j < y1; j++) {
+		int sa = x0, sb = x0, have = 0; /* [sa, sb) = span filled without evaluating the SDF */
+		if (r >= 1.f && fabsf(j + 0.5f - cy) <= hh - r) {
+			sa = MAX(xs, x0);
+			sb = MIN(xe, x1);
+			have = sb > sa;
+		}
+		int le = have ? sa : x1; /* SDF pixels: [x0, le) and [re, x1) */
+		int re = have ? sb : x1;
+		for (int i = x0; i < le; i++) {
+			float cov = CL01(0.5f - sdf_rr(i + 0.5f, j + 0.5f, cx, cy, hw, hh, r));
 			if (cov > 0.f) put_px(i, j, c, a256(cov * alpha));
 		}
+		if (have && aa > 0) {
+			uint32_t *p = &fb[(size_t)j * FW];
+			if (aa >= 256)
+				for (int i = sa; i < sb; i++) p[i] = c;
+			else
+				for (int i = sa; i < sb; i++) p[i] = blend_px(p[i], c, aa);
+		}
+		for (int i = re; i < x1; i++) {
+			float cov = CL01(0.5f - sdf_rr(i + 0.5f, j + 0.5f, cx, cy, hw, hh, r));
+			if (cov > 0.f) put_px(i, j, c, a256(cov * alpha));
+		}
+	}
 }
 static void rrect_line(float x, float y, float w, float h, float r, float t, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int x0 = MAX((int)floorf(x) - 1, cx0_), y0 = MAX((int)floorf(y) - 1, cy0_), x1 = MIN((int)ceilf(x + w) + 1, cx1_), y1 = MIN((int)ceilf(y + h) + 1, cy1_);
 	float cx = x + w * 0.5f, cy = y + h * 0.5f, hw = w * 0.5f, hh = h * 0.5f;
 	r = MIN(r, MIN(hw, hh));
-	for (int j = y0; j < y1; j++)
+	int M = (int)ceilf(t) + 3;
+	for (int j = y0; j < y1; j++) {
+		/* far from the top/bottom edge only the left and right margins can contain the outline */
+		int skip = r >= 1.f && fabsf(j + 0.5f - cy) <= hh - r - t - 2.f;
 		for (int i = x0; i < x1; i++) {
+			if (skip && i >= x0 + M && i < x1 - M) {
+				i = x1 - M - 1;
+				continue;
+			}
 			float d = fabsf(sdf_rr(i + 0.5f, j + 0.5f, cx, cy, hw, hh, r) + t * 0.5f) - t * 0.5f;
 			float cov = CL01(0.5f - d);
 			if (cov > 0.f) put_px(i, j, c, a256(cov * alpha));
 		}
+	}
 }
 static void disc(float cx, float cy, float r, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int x0 = MAX((int)floorf(cx - r - 1), cx0_), y0 = MAX((int)floorf(cy - r - 1), cy0_), x1 = MIN((int)ceilf(cx + r + 1), cx1_), y1 = MIN((int)ceilf(cy + r + 1), cy1_);
 	for (int j = y0; j < y1; j++)
 		for (int i = x0; i < x1; i++) {
@@ -104,6 +139,7 @@ static void disc(float cx, float cy, float r, uint32_t c, float alpha) {
 		}
 }
 static void ring(float cx, float cy, float r, float t, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	float ro = r + t * 0.5f;
 	int x0 = MAX((int)floorf(cx - ro - 1), cx0_), y0 = MAX((int)floorf(cy - ro - 1), cy0_), x1 = MIN((int)ceilf(cx + ro + 1), cx1_), y1 = MIN((int)ceilf(cy + ro + 1), cy1_);
 	for (int j = y0; j < y1; j++)
@@ -115,6 +151,7 @@ static void ring(float cx, float cy, float r, float t, uint32_t c, float alpha) 
 		}
 }
 static void ellipse_ring(float cx, float cy, float a, float b, float ang, float t, uint32_t c, float alpha, int dashed) {
+	if (ui_dry) return;
 	int N = MAX(48, (int)(MAX(a, b) * 0.6f));
 	float cs = cosf(ang), sn = sinf(ang), px = 0, py = 0;
 	for (int i = 0; i <= N; i++) {
@@ -140,6 +177,7 @@ static void ellipse_ring(float cx, float cy, float a, float b, float ang, float 
 	}
 }
 static void line_aa(float x0, float y0, float x1, float y1, float t, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	float dx = x1 - x0, dy = y1 - y0, len2 = dx * dx + dy * dy;
 	int bx0 = MAX((int)floorf(MIN(x0, x1) - t - 1), cx0_), bx1 = MIN((int)ceilf(MAX(x0, x1) + t + 1), cx1_);
 	int by0 = MAX((int)floorf(MIN(y0, y1) - t - 1), cy0_), by1 = MIN((int)ceilf(MAX(y0, y1) + t + 1), cy1_);
@@ -153,6 +191,7 @@ static void line_aa(float x0, float y0, float x1, float y1, float t, uint32_t c,
 		}
 }
 static void tri(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int bx0 = MAX((int)floorf(MIN(x0, MIN(x1, x2))) - 1, cx0_), bx1 = MIN((int)ceilf(MAX(x0, MAX(x1, x2))) + 1, cx1_);
 	int by0 = MAX((int)floorf(MIN(y0, MIN(y1, y2))) - 1, cy0_), by1 = MIN((int)ceilf(MAX(y0, MAX(y1, y2))) + 1, cy1_);
 	float ax[3] = {x0, x1, x2}, ay[3] = {y0, y1, y2};
@@ -172,6 +211,7 @@ static void tri(float x0, float y0, float x1, float y1, float x2, float y2, uint
 		}
 }
 static void soft_shadow(int x, int y, int w, int h, int r, float alpha) {
+	if (ui_dry) return;
 	for (int i = r; i >= 1; i--) {
 		float a = alpha * (1.f - (float)i / (r + 1)) * (1.f - (float)i / (r + 1)) * 0.5f;
 		rrect((float)(x - i), (float)(y - i + r / 3), (float)(w + 2 * i), (float)(h + 2 * i), (float)(i + 2), 0x000000, a);
@@ -250,7 +290,7 @@ static float text(float x, float cy, const char *s, int px, int wt, uint32_t col
 	float xp = x;
 	for (; *s; s++) {
 		Glyph *g = get_glyph(wt, si, (unsigned char)*s);
-		if (g->bm) {
+		if (g->bm && !ui_dry) {
 			int gx = (int)floorf(xp + 0.5f) + g->xo, gy = base + g->yo;
 			for (int j = 0; j < g->h; j++) {
 				int yy = gy + j;

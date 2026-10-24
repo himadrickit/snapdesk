@@ -16286,7 +16286,7 @@ enum { BR_MODE, BR_STR, BR_SIZE, BR_HARD, BR_FLOW };
 enum { HE_SIZE };
 enum { PO_SMOOTH, PO_BRIGHT, PO_WARM };
 enum { VG_OUTER, VG_INNER, VG_SIZE, VG_FEATHER, VG_ROUND };
-enum { LN_SHAPE, LN_BLUR, LN_TRANS, LN_SIZE, LN_ANGLE, LN_VIG };
+enum { LN_SHAPE, LN_BLUR, LN_TRANS, LN_VIG };
 enum { TX_SIZE, TX_COLOR, TX_OPAC, TX_STYLE, TX_ROT };
 enum { FR_STYLE, FR_WIDTH, FR_COLOR, FR_CORNER };
 enum { BW_FILTER, BW_TONE, BW_BRI, BW_CON, BW_GRAIN };
@@ -16340,7 +16340,7 @@ static const ToolDef TD[T_COUNT] = {
 	[T_HEAL] = {"Healing", "RETOUCH", 'H', 1, {SL("Size", 3, 100, 25)}},
 	[T_PORTRAIT] = {"Portrait", "RETOUCH", 'O', 3, {SL("Skin Smoothing", 0, 100, 40), SL("Face Brighten", 0, 100, 0), SL("Skin Warmth", -100, 100, 0)}},
 	[T_VIGNETTE] = {"Vignette", "RETOUCH", 'G', 5, {SL("Outer Brightness", -100, 100, -50), SL("Inner Brightness", -100, 100, 0), SL("Size", 0, 100, 50), SL("Feather", 0, 100, 60), SL("Roundness", -100, 100, 0)}},
-	[T_LENS] = {"Lens Blur", "RETOUCH", 'L', 6, {CHO("Shape", "Elliptical|Linear"), SL("Blur", 0, 100, 50), SL("Transition", 0, 100, 50), SL("Focus Size", 0, 100, 40), SL("Angle", -90, 90, 0), SL("Vignette", 0, 100, 0)}},
+	[T_LENS] = {"Lens Blur", "RETOUCH", 'L', 4, {CHO("Shape", "Elliptical|Linear"), SL("Blur", 0, 100, 50), SL("Transition", 0, 100, 50), SL("Vignette", 0, 100, 0)}},
 	[T_TEXT] = {"Text", "RETOUCH", 'X', 5, {SL("Size", 1, 100, 30), CHO("Color", "White|Black|Red|Yellow|Teal|Blue|Pink"), SL("Opacity", 0, 100, 100), CHO("Style", "Normal|Outline|Shadow|Plate"), SL("Rotation", -180, 180, 0)}},
 	[T_FRAME] = {"Frames", "RETOUCH", 'F', 4, {CHO("Style", "Solid|Polaroid|Double|Inset"), SL("Width", 0, 100, 20), CHO("Color", "White|Black|Gray|Cream|Ink|Sand"), SL("Corners", 0, 100, 0)}},
 	[T_BW] = {"Black & White", "FILTERS", '1', 5, {CHO("Filter", "Neutral|Red|Orange|Yellow|Green|Blue"), CHO("Tone", "None|Sepia|Cool|Gold|Selenium"), SL("Brightness", -100, 100, 0), SL("Contrast", -100, 100, 20), SL("Grain", 0, 100, 0)}},
@@ -16421,6 +16421,8 @@ typedef struct Layer {
 	float mix[8][3]; /* colour mixer: hue, saturation, luminance per colour band */
 	char text[96];
 	char path[1024]; /* double exposure: second photo */
+	int area_on, area_inv; /* movable / resizable / rotatable elliptical area that limits the effect */
+	float ax, ay, arx, ary, arot, afea; /* centre (0..1), half-axes (fractions of the short side), rotation (rad), feather (0..100) */
 	int mask_on, mask_inv; /* per-layer mask: strokes paint where the effect shows */
 	Pt *mpts;
 	int nmpts, cmpts;
@@ -16444,6 +16446,13 @@ static void layer_params_default(Layer *L) {
 	const ToolDef *d = &TD[L->tool];
 	for (int i = 0; i < d->np; i++) L->p[i] = d->p[i].def;
 }
+static void area_reset(Layer *L) {
+	L->ax = L->ay = 0.5f;
+	L->arx = L->tool == T_LENS ? 0.405f : 0.32f;
+	L->ary = L->tool == T_LENS ? 0.255f : 0.22f;
+	L->arot = 0.f;
+	L->afea = 45.f;
+}
 static void layer_init(Layer *L, int tool) {
 	memset(L, 0, sizeof *L);
 	L->tool = tool;
@@ -16455,6 +16464,8 @@ static void layer_init(Layer *L, int tool) {
 	L->cr[2] = L->cr[3] = 1;
 	for (int c = 0; c < 4; c++) curves_reset(L, c);
 	layer_params_default(L);
+	area_reset(L);
+	if (tool == T_LENS) L->area_on = 1;
 	layer_bump(L);
 }
 static void brt_free(BrushRT *rt);
@@ -17515,12 +17526,11 @@ static void apply_lens(const Layer *L, Img *im) {
 		memset(&c, 0, sizeof c);
 		c.w = w;
 		c.h = h;
-		c.cx = L->cx * w;
-		c.cy = L->cy * h;
-		float rf = (0.08f + L->p[LN_SIZE] / 100.f * 0.55f) * m;
-		c.a = rf * 1.35f;
-		c.b = rf * 0.85f;
-		float th = L->p[LN_ANGLE] * PI_F / 180.f;
+		c.cx = L->ax * w;
+		c.cy = L->ay * h;
+		c.a = L->arx * m;
+		c.b = L->ary * m;
+		float th = L->arot;
 		c.cs = cosf(th);
 		c.sn = sinf(th);
 		c.tw = 0.12f + L->p[LN_TRANS] / 100.f * 1.1f;
@@ -18907,29 +18917,44 @@ static const float *layer_mask(Layer *L, int w, int h) {
 	brt_raster(rt, L->mstr, L->nmstr, L->mpts);
 	return rt->map[0];
 }
-typedef struct { Img *im; const Img *before; const float *map; int inv, full; } MaskCtx;
+/* soft elliptical area weight (1 inside, 0 outside); axes in fractions of the short side */
+static inline float area_weight(const Layer *L, float x, float y, int w, int h, float m) {
+	float dx = x - L->ax * w, dy = y - L->ay * h, c = cosf(L->arot), s = sinf(L->arot);
+	float u = (dx * c + dy * s) / (L->arx * m), v = (-dx * s + dy * c) / (L->ary * m);
+	float d = sqrtf(u * u + v * v), f = 0.03f + 0.9f * L->afea / 100.f;
+	float k = 1.f - smoothf(1.f - f, 1.f + f * 0.3f, d);
+	return L->area_inv ? 1.f - k : k;
+}
+typedef struct { Img *im; const Img *before; const float *map; const Layer *L; int inv, use_mask, use_area; } MaskCtx;
 static void mask_job(void *v, int y0, int y1) {
 	MaskCtx *c = (MaskCtx *)v;
-	int w = c->im->w;
+	int w = c->im->w, h = c->im->h;
+	float m = (float)MIN(w, h);
 	for (int y = y0; y < y1; y++) {
 		float *p = c->im->p + (size_t)y * w * 3;
 		const float *q = c->before->p + (size_t)y * w * 3;
 		for (int x = 0; x < w; x++, p += 3, q += 3) {
-			float a = c->full ? 1.f : (c->map ? CL01(c->map[(size_t)y * w + x]) : 0.f);
-			if (c->inv) a = 1.f - a;
+			float a = 1.f;
+			if (c->use_mask) {
+				a = c->map ? CL01(c->map[(size_t)y * w + x]) : 0.f;
+				if (c->inv) a = 1.f - a;
+			}
+			if (c->use_area) a *= area_weight(c->L, x + 0.5f, y + 0.5f, w, h, m);
 			for (int k = 0; k < 3; k++) p[k] = LERP(q[k], p[k], a);
 		}
 	}
 }
+static inline int uses_area(const Layer *L) { return L->area_on && L->tool != T_LENS && maskable(L->tool); }
 static void apply_layer(Layer *L, Img *im) {
-	if (!L->mask_on || !maskable(L->tool)) {
+	int um = L->mask_on && maskable(L->tool), ua = uses_area(L);
+	if (!um && !ua) {
 		apply_layer_raw(L, im);
 		return;
 	}
 	Img before = img_clone(im);
 	apply_layer_raw(L, im);
 	if (im->w == before.w && im->h == before.h) {
-		MaskCtx c = {im, &before, layer_mask(L, im->w, im->h), L->mask_inv, 0};
+		MaskCtx c = {im, &before, um ? layer_mask(L, im->w, im->h) : NULL, L, L->mask_inv, um, ua};
 		parallel(mask_job, &c, im->h);
 	}
 	img_free(&before);
@@ -18977,7 +19002,7 @@ typedef struct {
 	uint8_t *rgb; /* source pixels, EXIF-oriented, RGB8 */
 	int w, h;
 	Img proxy; /* float preview-resolution copy of the source */
-	Img proxy_lo; /* half-size copy used while a slider / scrub is being dragged */
+	Img proxy_lo, proxy_lo4; /* half-size and quarter-size copies used while a value is being dragged */
 	int proxy_max;
 	uint32_t proxy_gen;
 	int loaded;
@@ -19082,7 +19107,7 @@ static Img pf, out;
 static int pf_ok = 0, pf_k = -1, out_ok = 0;
 /* drag-time quick preview: the same stack rendered on a half-size proxy, then upscaled */
 static Img pfL, outL;
-static int pfL_ok = 0, pfL_k = -1, outL_ok = 0, lo_shown = 0;
+static int pfL_ok = 0, pfL_k = -1, outL_ok = 0, lo_shown = 0, pfL_level = 0, lo_level = 1;
 static uint64_t pfL_sig = 0, outL_sig = 0;
 static int interacting_now(void);
 static double full_ms = 0; /* cost of the last full-quality render: the quick preview is only used when it is high */
@@ -19121,13 +19146,19 @@ static void pipeline_invalidate(void) {
 }
 static double now_ms(void) { return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(); }
 
-static void pipeline_render_lo(int n, int K) {
+static void pipeline_render_lo(int n, int K, int level) {
+	if (level != pfL_level) {
+		pfL_ok = 0;
+		outL_ok = 0;
+		pfL_level = level;
+	}
+	const Img *base = level == 2 ? &doc.proxy_lo4 : &doc.proxy_lo;
 	uint64_t sigK = stack_sig(K);
 	if (!(pfL_ok && pfL_k == K && pfL_sig == sigK)) {
 		if (outL_ok && K == n && outL_sig == sigK)
 			img_assign(&pfL, &outL);
 		else {
-			img_assign(&pfL, &doc.proxy_lo);
+			img_assign(&pfL, base);
 			for (int i = 0; i < K; i++)
 				if (eff_visible(i)) apply_layer(&stack[i], &pfL);
 		}
@@ -19143,16 +19174,20 @@ static void pipeline_render_lo(int n, int K) {
 		outL_sig = sigN;
 		outL_ok = 1;
 	}
-	/* upscale to exactly the size the full-quality render will have, so the view does not jump */
+	/* `out` keeps the size the full-quality render has; if that is unchanged the small result is shown
+	 * directly (the canvas scales it), otherwise it is upscaled once so the view does not jump */
 	int ew = doc.proxy.w, eh = doc.proxy.h;
 	for (int i = 0; i < n; i++)
 		if (eff_visible(i)) layer_outdims(&stack[i], &ew, &eh);
-	Img up = (outL.w == ew && outL.h == eh) ? img_clone(&outL) : resize_f(&outL, ew, eh);
-	img_free(&out);
-	out = up;
-	out_ok = 0; /* `out` is not full quality now */
+	if (!(out.p && out.w == ew && out.h == eh)) {
+		Img up = resize_f(&outL, ew, eh);
+		img_free(&out);
+		out = up;
+		mips_from_img(&disp, &out);
+	} else
+		mips_from_img(&disp, &outL);
+	out_ok = 0; /* `out` is not up to date now */
 	lo_shown = 1;
-	mips_from_img(&disp, &out);
 	compute_histogram(&disp);
 	render_serial++;
 }
@@ -19161,8 +19196,9 @@ static void pipeline_render(void) {
 	double t0 = now_ms();
 	int n = nlayers;
 	int K = active >= 0 ? active : n;
-	if (doc.proxy_lo.p && full_ms > 45.0 && interacting_now()) {
-		pipeline_render_lo(n, K);
+	if (doc.proxy_lo.p && full_ms > 25.0 && interacting_now()) {
+		if (!lo_shown) lo_level = (full_ms * 0.25 > 28.0 && doc.proxy_lo4.p) ? 2 : 1; /* heavier tool: smaller preview */
+		pipeline_render_lo(n, K, lo_level);
 		need_render = 0;
 		last_render_ms = now_ms() - t0;
 		return;
@@ -19408,7 +19444,7 @@ static int look_saveable(const Layer *L) {
 	switch (L->tool) {
 	case T_CROP: case T_ROTATE: case T_PERSP: case T_EXPAND: case T_BRUSH: case T_HEAL: case T_SELECTIVE: case T_TEXT: case T_DOUBLE: return 0;
 	}
-	return !L->mask_on;
+	return !L->mask_on && !(L->area_on && L->tool != T_LENS);
 }
 static char *looks_file(char *buf, size_t cap) {
 	char *pd = SDL_GetPrefPath("snapdesk", "snapdesk");
@@ -19643,7 +19679,11 @@ static void proxy_build(void) {
 	}
 	doc.proxy = resize_u8(doc.rgb, doc.w, doc.h, tw, th);
 	img_free(&doc.proxy_lo);
-	if ((long)tw * th > proxy_lo_min) doc.proxy_lo = resize_f(&doc.proxy, MAX(1, (tw + 1) / 2), MAX(1, (th + 1) / 2));
+	img_free(&doc.proxy_lo4);
+	if ((long)tw * th > proxy_lo_min) {
+		doc.proxy_lo = resize_f(&doc.proxy, MAX(1, (tw + 1) / 2), MAX(1, (th + 1) / 2));
+		doc.proxy_lo4 = resize_f(&doc.proxy, MAX(1, (tw + 3) / 4), MAX(1, (th + 3) / 4));
+	}
 	doc.proxy_gen++;
 	mips_from_img(&odisp, &doc.proxy);
 	pipeline_invalidate();
@@ -19804,6 +19844,7 @@ static int cx0_ = 0, cy0_ = 0, cx1_ = 0, cy1_ = 0; /* clip rect [x0,x1) [y0,y1) 
 #define C_G_RET 0xf2a03d
 #define C_G_FIL 0xb77cf0
 
+static int ui_dry = 0; /* input-only pass: layout and widget logic run, nothing is drawn (the clip is empty) */
 typedef struct { int x0, y0, x1, y1; } Clip;
 static Clip clip_get(void) { Clip c = {cx0_, cy0_, cx1_, cy1_}; return c; }
 static void clip_set(Clip c) { cx0_ = c.x0; cy0_ = c.y0; cx1_ = c.x1; cy1_ = c.y1; }
@@ -19834,6 +19875,7 @@ static inline void put_px(int x, int y, uint32_t c, int a) {
 static inline int a256(float alpha) { return (int)(CL01(alpha) * 256.f + 0.5f); }
 
 static void fill_rect(int x, int y, int w, int h, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int x0 = MAX(x, cx0_), y0 = MAX(y, cy0_), x1 = MIN(x + w, cx1_), y1 = MIN(y + h, cy1_);
 	int a = a256(alpha);
 	if (a <= 0) return;
@@ -19857,28 +19899,61 @@ static float sdf_rr(float px, float py, float cx, float cy, float hw, float hh, 
 	return sqrtf(ox * ox + oy * oy) + MIN(MAX(qx, qy), 0.f) - r;
 }
 static void rrect(float x, float y, float w, float h, float r, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int x0 = MAX((int)floorf(x), cx0_), y0 = MAX((int)floorf(y), cy0_), x1 = MIN((int)ceilf(x + w), cx1_), y1 = MIN((int)ceilf(y + h), cy1_);
 	float cx = x + w * 0.5f, cy = y + h * 0.5f, hw = w * 0.5f, hh = h * 0.5f;
 	r = MIN(r, MIN(hw, hh));
-	for (int j = y0; j < y1; j++)
-		for (int i = x0; i < x1; i++) {
-			float d = sdf_rr(i + 0.5f, j + 0.5f, cx, cy, hw, hh, r);
-			float cov = CL01(0.5f - d);
+	int aa = a256(alpha);
+	/* rows in the straight band: the interior is fully covered, only the 1-2 edge pixels need the SDF */
+	int xs = (int)ceilf(x), xe = (int)floorf(x + w);
+	for (int j = y0; j < y1; j++) {
+		int sa = x0, sb = x0, have = 0; /* [sa, sb) = span filled without evaluating the SDF */
+		if (r >= 1.f && fabsf(j + 0.5f - cy) <= hh - r) {
+			sa = MAX(xs, x0);
+			sb = MIN(xe, x1);
+			have = sb > sa;
+		}
+		int le = have ? sa : x1; /* SDF pixels: [x0, le) and [re, x1) */
+		int re = have ? sb : x1;
+		for (int i = x0; i < le; i++) {
+			float cov = CL01(0.5f - sdf_rr(i + 0.5f, j + 0.5f, cx, cy, hw, hh, r));
 			if (cov > 0.f) put_px(i, j, c, a256(cov * alpha));
 		}
+		if (have && aa > 0) {
+			uint32_t *p = &fb[(size_t)j * FW];
+			if (aa >= 256)
+				for (int i = sa; i < sb; i++) p[i] = c;
+			else
+				for (int i = sa; i < sb; i++) p[i] = blend_px(p[i], c, aa);
+		}
+		for (int i = re; i < x1; i++) {
+			float cov = CL01(0.5f - sdf_rr(i + 0.5f, j + 0.5f, cx, cy, hw, hh, r));
+			if (cov > 0.f) put_px(i, j, c, a256(cov * alpha));
+		}
+	}
 }
 static void rrect_line(float x, float y, float w, float h, float r, float t, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int x0 = MAX((int)floorf(x) - 1, cx0_), y0 = MAX((int)floorf(y) - 1, cy0_), x1 = MIN((int)ceilf(x + w) + 1, cx1_), y1 = MIN((int)ceilf(y + h) + 1, cy1_);
 	float cx = x + w * 0.5f, cy = y + h * 0.5f, hw = w * 0.5f, hh = h * 0.5f;
 	r = MIN(r, MIN(hw, hh));
-	for (int j = y0; j < y1; j++)
+	int M = (int)ceilf(t) + 3;
+	for (int j = y0; j < y1; j++) {
+		/* far from the top/bottom edge only the left and right margins can contain the outline */
+		int skip = r >= 1.f && fabsf(j + 0.5f - cy) <= hh - r - t - 2.f;
 		for (int i = x0; i < x1; i++) {
+			if (skip && i >= x0 + M && i < x1 - M) {
+				i = x1 - M - 1;
+				continue;
+			}
 			float d = fabsf(sdf_rr(i + 0.5f, j + 0.5f, cx, cy, hw, hh, r) + t * 0.5f) - t * 0.5f;
 			float cov = CL01(0.5f - d);
 			if (cov > 0.f) put_px(i, j, c, a256(cov * alpha));
 		}
+	}
 }
 static void disc(float cx, float cy, float r, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int x0 = MAX((int)floorf(cx - r - 1), cx0_), y0 = MAX((int)floorf(cy - r - 1), cy0_), x1 = MIN((int)ceilf(cx + r + 1), cx1_), y1 = MIN((int)ceilf(cy + r + 1), cy1_);
 	for (int j = y0; j < y1; j++)
 		for (int i = x0; i < x1; i++) {
@@ -19888,6 +19963,7 @@ static void disc(float cx, float cy, float r, uint32_t c, float alpha) {
 		}
 }
 static void ring(float cx, float cy, float r, float t, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	float ro = r + t * 0.5f;
 	int x0 = MAX((int)floorf(cx - ro - 1), cx0_), y0 = MAX((int)floorf(cy - ro - 1), cy0_), x1 = MIN((int)ceilf(cx + ro + 1), cx1_), y1 = MIN((int)ceilf(cy + ro + 1), cy1_);
 	for (int j = y0; j < y1; j++)
@@ -19899,6 +19975,7 @@ static void ring(float cx, float cy, float r, float t, uint32_t c, float alpha) 
 		}
 }
 static void ellipse_ring(float cx, float cy, float a, float b, float ang, float t, uint32_t c, float alpha, int dashed) {
+	if (ui_dry) return;
 	int N = MAX(48, (int)(MAX(a, b) * 0.6f));
 	float cs = cosf(ang), sn = sinf(ang), px = 0, py = 0;
 	for (int i = 0; i <= N; i++) {
@@ -19924,6 +20001,7 @@ static void ellipse_ring(float cx, float cy, float a, float b, float ang, float 
 	}
 }
 static void line_aa(float x0, float y0, float x1, float y1, float t, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	float dx = x1 - x0, dy = y1 - y0, len2 = dx * dx + dy * dy;
 	int bx0 = MAX((int)floorf(MIN(x0, x1) - t - 1), cx0_), bx1 = MIN((int)ceilf(MAX(x0, x1) + t + 1), cx1_);
 	int by0 = MAX((int)floorf(MIN(y0, y1) - t - 1), cy0_), by1 = MIN((int)ceilf(MAX(y0, y1) + t + 1), cy1_);
@@ -19937,6 +20015,7 @@ static void line_aa(float x0, float y0, float x1, float y1, float t, uint32_t c,
 		}
 }
 static void tri(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t c, float alpha) {
+	if (ui_dry) return;
 	int bx0 = MAX((int)floorf(MIN(x0, MIN(x1, x2))) - 1, cx0_), bx1 = MIN((int)ceilf(MAX(x0, MAX(x1, x2))) + 1, cx1_);
 	int by0 = MAX((int)floorf(MIN(y0, MIN(y1, y2))) - 1, cy0_), by1 = MIN((int)ceilf(MAX(y0, MAX(y1, y2))) + 1, cy1_);
 	float ax[3] = {x0, x1, x2}, ay[3] = {y0, y1, y2};
@@ -19956,6 +20035,7 @@ static void tri(float x0, float y0, float x1, float y1, float x2, float y2, uint
 		}
 }
 static void soft_shadow(int x, int y, int w, int h, int r, float alpha) {
+	if (ui_dry) return;
 	for (int i = r; i >= 1; i--) {
 		float a = alpha * (1.f - (float)i / (r + 1)) * (1.f - (float)i / (r + 1)) * 0.5f;
 		rrect((float)(x - i), (float)(y - i + r / 3), (float)(w + 2 * i), (float)(h + 2 * i), (float)(i + 2), 0x000000, a);
@@ -20034,7 +20114,7 @@ static float text(float x, float cy, const char *s, int px, int wt, uint32_t col
 	float xp = x;
 	for (; *s; s++) {
 		Glyph *g = get_glyph(wt, si, (unsigned char)*s);
-		if (g->bm) {
+		if (g->bm && !ui_dry) {
 			int gx = (int)floorf(xp + 0.5f) + g->xo, gy = base + g->yo;
 			for (int j = 0; j < g->h; j++) {
 				int yy = gy + j;
@@ -20117,6 +20197,7 @@ static int mdx = 0, mdy = 0;            /* mouse delta since last frame */
 static int m_down[3], m_press[3], m_rel[3];
 static int m_dbl = 0, wheel = 0, wheel_used = 0;
 static int mod_shift = 0, mod_ctrl = 0, mod_alt = 0;
+static float gest_dist = 0.f, gest_theta = 0.f; /* two-finger pinch / twist this frame */
 static int act_id = 0;                  /* widget currently being dragged */
 static int modal = 0, in_modal_draw = 0;
 static int quit_flag = 0, dirty = 1;
@@ -20454,31 +20535,54 @@ static void canvas_job(void *v, int ya, int yb) {
 	float lsc = 1.f / (float)(1 << lev);
 	const uint32_t *px = m->px[lev];
 	int nearest_ = c->zoom >= 5.f;
+	/* per-column sample positions are the same for every row: compute them once per job */
+	int cw = c->w;
+	int *cx0 = (int *)xmalloc(sizeof(int) * 3 * (size_t)cw), *cx1 = cx0 + cw, *cax = cx1 + cw;
+	for (int x = 0; x < cw; x++) {
+		float ix = (c->cx + (x + 0.5f - cw * 0.5f) / c->zoom) * lsc;
+		if (ix < 0 || ix >= W) {
+			cx0[x] = -1;
+			continue;
+		}
+		if (nearest_) {
+			cx0[x] = (int)ix;
+			continue;
+		}
+		float fx = ix - 0.5f;
+		int x0 = (int)floorf(fx);
+		cax[x] = (int)((fx - x0) * 256.f);
+		cx1[x] = MIN(x0 + 1, W - 1);
+		cx0[x] = MAX(x0, 0);
+	}
 	for (int y = ya; y < yb; y++) {
 		uint32_t *d = &fb[(size_t)(c->y0 + y) * FW + c->x0];
 		float iy = (c->cy + (y + 0.5f - c->h * 0.5f) / c->zoom) * lsc;
 		if (iy < 0 || iy >= H) continue;
-		for (int x = 0; x < c->w; x++) {
-			float ix = (c->cx + (x + 0.5f - c->w * 0.5f) / c->zoom) * lsc;
-			if (ix < 0 || ix >= W) continue;
-			if (nearest_) {
-				d[x] = px[(size_t)(int)iy * W + (int)ix];
-				continue;
-			}
-			float fx = ix - 0.5f, fy = iy - 0.5f;
-			int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
-			int ax = (int)((fx - x0) * 256.f), ay = (int)((fy - y0) * 256.f);
-			int x1 = MIN(x0 + 1, W - 1), y1 = MIN(y0 + 1, H - 1);
-			x0 = MAX(x0, 0);
-			y0 = MAX(y0, 0);
-			uint32_t p00 = px[(size_t)y0 * W + x0], p10 = px[(size_t)y0 * W + x1], p01 = px[(size_t)y1 * W + x0], p11 = px[(size_t)y1 * W + x1];
-			uint32_t t0 = blend_px(p00, p10, ax), t1 = blend_px(p01, p11, ax);
+		if (nearest_) {
+			const uint32_t *r = px + (size_t)(int)iy * W;
+			for (int x = 0; x < cw; x++)
+				if (cx0[x] >= 0) d[x] = r[cx0[x]];
+			continue;
+		}
+		float fy = iy - 0.5f;
+		int y0 = (int)floorf(fy);
+		int ay = (int)((fy - y0) * 256.f);
+		int y1 = MIN(y0 + 1, H - 1);
+		y0 = MAX(y0, 0);
+		const uint32_t *r0 = px + (size_t)y0 * W, *r1 = px + (size_t)y1 * W;
+		for (int x = 0; x < cw; x++) {
+			int xa = cx0[x];
+			if (xa < 0) continue;
+			int xb = cx1[x], ax = cax[x];
+			uint32_t t0 = blend_px(r0[xa], r0[xb], ax), t1 = blend_px(r1[xa], r1[xb], ax);
 			d[x] = blend_px(t0, t1, ay);
 		}
 	}
+	free(cx0);
 }
 static void draw_mips(const Mips *m, int x0, int y0, int w, int h, float cx, float cy, float z) {
 	if (!m->n) return;
+	if (ui_dry) return;
 	DrawCtx c = {m, x0, y0, w, h, cx, cy, z};
 	Clip o = clip_push(x0, y0, w, h);
 	/* only rows/cols inside the clip are valid; canvas rect is always inside fb */
@@ -20605,6 +20709,7 @@ static void layer_reset(Layer *L) {
 	case T_VIGNETTE:
 	case T_LENS:
 		L->cx = L->cy = 0.5f;
+		area_reset(L);
 		layer_params_default(L);
 		break;
 	case T_GRAD:
@@ -20784,7 +20889,8 @@ static void draw_looks(int x, int y, int w, int h) {
 			toast("Look deleted");
 			break;
 		}
-		if (lt_have[i] && lthumb[i]) {
+		if (ui_dry) {
+		} else if (lt_have[i] && lthumb[i]) {
 			for (int j = 0; j < LT_H; j++) memcpy(&fb[(size_t)(by + j) * FW + bx], &lthumb[i][j * LT_W], LT_W * 4);
 		} else
 			fill_rect(bx, by, LT_W, LT_H, C_PANEL2, 1);
@@ -20920,6 +21026,42 @@ static void mask_clear(Layer *L) {
 		L->mrt = NULL;
 	}
 	touch(L);
+}
+static void area_section(Layer *L, int x, int *py, int w) {
+	if (!maskable(L->tool) || L->tool == T_LENS) return;
+	*py += 6;
+	fill_rect(x, *py, w, 1, C_LINE, 1);
+	*py += 10;
+	text((float)x, *py + 8, "AREA", 11, 1, C_DIM, 1);
+	if (button(4930, x + w - 64, *py - 2, 64, 22, L->area_on ? "On" : "Off", L->area_on ? BS_ACCENT : BS_NORMAL, 0)) {
+		L->area_on ^= 1;
+		if (L->area_on && !L->touched) L->touched = 1;
+		touch(L);
+	}
+	*py += 28;
+	if (!L->area_on) {
+		hint_text(x, py, w, "Limit this effect to a movable, resizable, rotatable oval.");
+		return;
+	}
+	int bw = (w - 10) / 3;
+	if (button(4931, x, *py, bw, 24, "Circle", BS_NORMAL, 0)) {
+		float r = sqrtf(L->arx * L->ary);
+		L->arx = L->ary = r;
+		L->arot = 0.f;
+		touch(L);
+	}
+	if (button(4932, x + bw + 5, *py, bw, 24, "Invert", BS_NORMAL, L->area_inv)) {
+		L->area_inv ^= 1;
+		touch(L);
+	}
+	if (button(4933, x + 2 * (bw + 5), *py, bw, 24, "Reset", BS_NORMAL, 0)) {
+		area_reset(L);
+		touch(L);
+	}
+	*py += 32;
+	if (slider(4934, x, *py, w, "Feather", &L->afea, 0, 100, 45, 0, 0) & 1) touch(L);
+	*py += 42;
+	hint_text(x, py, w, "Drag inside to move, edge dots to resize, top dot to rotate. Shift = circle / 15-degree steps. Wheel = size, Shift+wheel = rotate.");
 }
 static void mask_section(Layer *L, int x, int *py, int w) {
 	if (!maskable(L->tool)) return;
@@ -21243,9 +21385,23 @@ static void panel_tool(int x, int y, int w, int h) {
 		hint_text(x, &py, w, "Click (or drag) over blemishes and dust spots. Wheel changes the size.");
 		break;
 	case T_VIGNETTE:
+		generic_params(L, x, &py, w);
+		hint_text(x, &py, w, "Drag on the photo to move the centre. Wheel changes the size.");
+		break;
 	case T_LENS:
 		generic_params(L, x, &py, w);
-		hint_text(x, &py, w, "Drag on the photo to move the centre.");
+		if (button(4940, x, py, (w - 5) / 2, 24, "Circle", BS_NORMAL, 0)) {
+			float r = sqrtf(L->arx * L->ary);
+			L->arx = L->ary = r;
+			L->arot = 0.f;
+			touch(L);
+		}
+		if (button(4941, x + (w - 5) / 2 + 5, py, (w - 5) / 2, 24, "Reset area", BS_NORMAL, 0)) {
+			area_reset(L);
+			touch(L);
+		}
+		py += 32;
+		hint_text(x, &py, w, "Drag inside to move. Drag the edge dots to resize, the top dot to rotate. Hold Shift for a perfect circle (or 15-degree steps). Wheel = size, Shift+wheel = rotate. Touch: pinch and twist.");
 		break;
 	case T_GRAD:
 		generic_params(L, x, &py, w);
@@ -21303,6 +21459,7 @@ static void panel_tool(int x, int y, int w, int h) {
 		if (L->tool != T_PERSP && L->tool != T_PORTRAIT && L->tool != T_FRAME) hint_text(x, &py, w, "Tip: drag up/down on the photo to pick a parameter, left/right to change it.");
 		break;
 	}
+	area_section(L, x, &py, w);
 	mask_section(L, x, &py, w);
 	panel_content = py - content_start + 8;
 	clip_set(c0);
@@ -21743,7 +21900,9 @@ static void heal_tool(Layer *L, int in_canvas) {
 }
 
 /* vignette / lens / text: drag the centre */
+static int ctr_drag = 0; /* a centre / position drag is in progress (quick preview applies) */
 static void center_tool(Layer *L, int in_canvas) {
+	ctr_drag = cdrag == 2;
 	float W = (float)out.w, H = (float)out.h, m = MIN(W, H);
 	float ix, iy;
 	scr2img((float)mx, (float)my, &ix, &iy);
@@ -21767,8 +21926,8 @@ static void center_tool(Layer *L, int in_canvas) {
 		} else
 			cdrag = 0;
 	}
-	if (in_canvas && wheel && !mod_ctrl && !wheel_used && L->tool == T_LENS) {
-		L->p[LN_SIZE] = CLAMP(L->p[LN_SIZE] + wheel * 3.f, 0.f, 100.f);
+	if (in_canvas && wheel && !mod_ctrl && !wheel_used && L->tool == T_VIGNETTE) {
+		L->p[VG_SIZE] = CLAMP(L->p[VG_SIZE] + wheel * 3.f, 0.f, 100.f);
 		wheel_used = 1;
 		touch(L);
 	}
@@ -21795,14 +21954,6 @@ static void center_tool(Layer *L, int in_canvas) {
 	if (L->tool == T_VIGNETTE) {
 		float inner = L->p[VG_SIZE] / 100.f * 0.85f;
 		ellipse_ring(sx, sy, inner * W * 0.5f / 0.7071f * zoom, inner * H * 0.5f / 0.7071f * zoom, 0, 1.4f, 0xffffff, 0.8f, 1);
-	} else if (L->tool == T_LENS) {
-		float rf = (0.08f + L->p[LN_SIZE] / 100.f * 0.55f) * m * zoom, th = L->p[LN_ANGLE] * PI_F / 180.f;
-		if ((int)L->p[LN_SHAPE] == 0)
-			ellipse_ring(sx, sy, rf * 1.35f, rf * 0.85f, th, 1.4f, 0xffffff, 0.85f, 1);
-		else {
-			float nx = -sinf(th), ny = cosf(th), tx = cosf(th), ty = sinf(th), L2 = 3000.f;
-			for (int s = -1; s <= 1; s += 2) line_aa(sx + nx * rf * 0.85f * s - tx * L2, sy + ny * rf * 0.85f * s - ty * L2, sx + nx * rf * 0.85f * s + tx * L2, sy + ny * rf * 0.85f * s + ty * L2, 1.4f, 0xffffff, 0.8f);
-		}
 	} else if (L->tool == T_TEXT) {
 		float px = MAX(6.f, L->p[TX_SIZE] / 100.f * 0.34f * m) * zoom;
 		float tw = text_width(L->text, 14, 1) / 14.f * px * 1.02f, th = px * 1.25f, a = L->p[TX_ROT] * PI_F / 180.f;
@@ -21901,6 +22052,154 @@ static void scrub_tool(Layer *L, int in_canvas) {
 	if (in_canvas || cdrag == 3) cursor_kind = scrub_axis == 2 ? 3 : (n > 0 ? 4 : 0);
 }
 
+
+/* ---- movable / resizable / rotatable oval (Lens Blur focus, or the Area of any effect) ----
+ * drag inside = move, edge dots = resize (Shift = circle), top dot = rotate (Shift = 15 degree steps),
+ * wheel = pinch in/out, Shift+wheel = rotate, two-finger pinch/twist on touch. Returns 1 if it used the mouse. */
+enum { AG_NONE, AG_MOVE, AG_RX, AG_RY, AG_ROT };
+static int ag_mode = AG_NONE, ag_hot = AG_NONE;
+static float ag_gx, ag_gy;
+static void area_clamp(Layer *L) {
+	L->arx = CLAMP(L->arx, 0.02f, 1.6f);
+	L->ary = CLAMP(L->ary, 0.02f, 1.6f);
+	L->ax = CLAMP(L->ax, -0.2f, 1.2f);
+	L->ay = CLAMP(L->ay, -0.2f, 1.2f);
+	while (L->arot > PI_F) L->arot -= 2.f * PI_F;
+	while (L->arot < -PI_F) L->arot += 2.f * PI_F;
+}
+static int area_tool(Layer *L, int in_canvas, int grab_anywhere) {
+	float W = (float)out.w, H = (float)out.h, m = MIN(W, H);
+	int linear = L->tool == T_LENS && (int)L->p[LN_SHAPE] == 1;
+	float k = m * zoom, ca = cosf(L->arot), sa = sinf(L->arot);
+	float sx, sy;
+	img2scr(L->ax * W, L->ay * H, &sx, &sy);
+	float exx = ca, exy = sa, eyx = -sa, eyy = ca; /* screen-space axes */
+	float rx = L->arx * k, ry = L->ary * k;
+	float hx[4][2] = {{sx + exx * rx, sy + exy * rx}, {sx - exx * rx, sy - exy * rx}, {sx + eyx * ry, sy + eyy * ry}, {sx - eyx * ry, sy - eyy * ry}};
+	float stem = ry + 30.f, rot_x = sx - eyx * stem, rot_y = sy - eyy * stem;
+	int used = 0;
+	/* hit-testing */
+	int hit = AG_NONE;
+	if (in_canvas || cdrag == 2) {
+		float R2 = 11.f * 11.f;
+		float dxm = (float)mx - sx, dym = (float)my - sy;
+		if ((mx - rot_x) * (mx - rot_x) + (my - rot_y) * (my - rot_y) < R2) hit = AG_ROT;
+		else if (!linear && ((mx - hx[0][0]) * (mx - hx[0][0]) + (my - hx[0][1]) * (my - hx[0][1]) < R2 || (mx - hx[1][0]) * (mx - hx[1][0]) + (my - hx[1][1]) * (my - hx[1][1]) < R2)) hit = AG_RX;
+		else if ((mx - hx[2][0]) * (mx - hx[2][0]) + (my - hx[2][1]) * (my - hx[2][1]) < R2 || (mx - hx[3][0]) * (mx - hx[3][0]) + (my - hx[3][1]) * (my - hx[3][1]) < R2) hit = AG_RY;
+		else {
+			float u = (dxm * exx + dym * exy) / MAX(rx, 1.f), v = (dxm * eyx + dym * eyy) / MAX(ry, 1.f);
+			if (grab_anywhere || (!linear && u * u + v * v <= 1.f) || (linear && fabsf(v) <= 1.f)) hit = AG_MOVE;
+		}
+	}
+	if (cdrag == 0) ag_hot = hit;
+	if (in_canvas && cdrag == 0 && m_press[0] && !mod_ctrl && hit != AG_NONE) {
+		ag_mode = hit;
+		cdrag = 2;
+		float ix, iy;
+		scr2img((float)mx, (float)my, &ix, &iy);
+		ag_gx = L->ax - ix / W;
+		ag_gy = L->ay - iy / H;
+	}
+	if (cdrag == 2 && ag_mode != AG_NONE) {
+		used = 1;
+		if (m_down[0]) {
+			float ix, iy;
+			scr2img((float)mx, (float)my, &ix, &iy);
+			float dx = ix - L->ax * W, dy = iy - L->ay * H;
+			switch (ag_mode) {
+			case AG_MOVE:
+				L->ax = ix / W + ag_gx;
+				L->ay = iy / H + ag_gy;
+				break;
+			case AG_RX: {
+				float r = fabsf(dx * ca + dy * sa) / m;
+				L->arx = r;
+				if (mod_shift) L->ary = r;
+			} break;
+			case AG_RY: {
+				float r = fabsf(-dx * sa + dy * ca) / m;
+				L->ary = r;
+				if (mod_shift && !linear) L->arx = r;
+			} break;
+			case AG_ROT: {
+				float a = atan2f(dy, dx) + PI_F * 0.5f;
+				if (mod_shift) a = roundf(a / (PI_F / 12.f)) * (PI_F / 12.f);
+				L->arot = a;
+			} break;
+			}
+			area_clamp(L);
+			touch(L);
+		} else {
+			cdrag = 0;
+			ag_mode = AG_NONE;
+		}
+	}
+	/* wheel = pinch, Shift+wheel = twist; touch gestures do the same */
+	if (in_canvas && wheel && !mod_ctrl && !wheel_used) {
+		if (mod_shift) L->arot += wheel * 5.f * PI_F / 180.f;
+		else {
+			float f = powf(1.07f, (float)wheel);
+			L->arx *= f;
+			L->ary *= f;
+		}
+		area_clamp(L);
+		wheel_used = 1;
+		touch(L);
+	}
+	if (in_canvas && (gest_dist != 0.f || gest_theta != 0.f)) {
+		float f = 1.f + gest_dist * 3.f;
+		L->arx *= f;
+		L->ary *= f;
+		L->arot += gest_theta;
+		area_clamp(L);
+		touch(L);
+	}
+	/* drawing */
+	Clip c = clip_push(cvx, cvy, cvw, cvh);
+	img2scr(L->ax * W, L->ay * H, &sx, &sy);
+	rx = L->arx * k;
+	ry = L->ary * k;
+	ca = cosf(L->arot);
+	sa = sinf(L->arot);
+	exx = ca; exy = sa; eyx = -sa; eyy = ca;
+	float fea = L->tool == T_LENS ? (0.12f + L->p[LN_TRANS] / 100.f * 1.1f) * 0.5f : (0.03f + 0.9f * L->afea / 100.f);
+	hx[0][0] = sx + exx * rx; hx[0][1] = sy + exy * rx; hx[1][0] = sx - exx * rx; hx[1][1] = sy - exy * rx;
+	hx[2][0] = sx + eyx * ry; hx[2][1] = sy + eyy * ry; hx[3][0] = sx - eyx * ry; hx[3][1] = sy - eyy * ry;
+	rot_x = sx - eyx * (ry + 30.f);
+	rot_y = sy - eyy * (ry + 30.f);
+	if (!linear) {
+		ellipse_ring(sx, sy, rx, ry, L->arot, 1.6f, 0xffffff, 0.9f, 0);
+		float fo = 1.f + MIN(fea, 1.5f) * 0.3f, fi = MAX(0.08f, 1.f - MIN(fea, 0.92f));
+		ellipse_ring(sx, sy, rx * fo, ry * fo, L->arot, 1.f, 0xffffff, 0.4f, 1);
+		ellipse_ring(sx, sy, rx * fi, ry * fi, L->arot, 1.f, 0xffffff, 0.3f, 1);
+	} else {
+		float Lh = 3000.f;
+		for (int s = -1; s <= 1; s += 2) line_aa(sx + eyx * ry * s - exx * Lh, sy + eyy * ry * s - exy * Lh, sx + eyx * ry * s + exx * Lh, sy + eyy * ry * s + exy * Lh, 1.6f, 0xffffff, 0.85f);
+		for (int s = -1; s <= 1; s += 2) {
+			float o = ry * (1.f + fea * 0.6f) * s;
+			line_aa(sx + eyx * o - exx * Lh, sy + eyy * o - exy * Lh, sx + eyx * o + exx * Lh, sy + eyy * o + exy * Lh, 1.f, 0xffffff, 0.3f);
+		}
+	}
+	line_aa(hx[3][0], hx[3][1], rot_x, rot_y, 1.2f, 0xffffff, 0.6f);
+	for (int i = 0; i < 4; i++) {
+		if (linear && i < 2) continue;
+		int hot = (ag_hot == AG_RX && i < 2) || (ag_hot == AG_RY && i >= 2);
+		disc(hx[i][0], hx[i][1], hot ? 8.f : 6.5f, 0x000000, 0.45f);
+		disc(hx[i][0], hx[i][1], hot ? 6.5f : 5.f, hot ? C_ACC : 0xffffff, 1);
+	}
+	disc(rot_x, rot_y, ag_hot == AG_ROT ? 8.f : 6.5f, 0x000000, 0.45f);
+	disc(rot_x, rot_y, ag_hot == AG_ROT ? 6.5f : 5.f, C_ACC, 1);
+	ring(rot_x, rot_y, 8.5f, 1.f, 0xffffff, 0.6f);
+	disc(sx, sy, 5.f, 0x000000, 0.4f);
+	disc(sx, sy, 4.f, C_ACC, 1);
+	clip_set(c);
+	if (in_canvas || cdrag == 2) {
+		int mode = cdrag == 2 ? ag_mode : ag_hot;
+		cursor_kind = mode == AG_ROT ? 7 : (mode == AG_RX ? 4 : (mode == AG_RY ? 3 : (mode == AG_MOVE ? 2 : 0)));
+		if (cursor_kind == 0 && !used) return 0;
+	}
+	return used || ag_hot != AG_NONE || cdrag == 2;
+}
 static int mask_for = -1;
 static void mask_tool(Layer *L, int in_canvas) {
 	float W = (float)out.w, H = (float)out.h, m = MIN(W, H);
@@ -21983,9 +22282,13 @@ static void canvas_tool(int in_canvas) {
 	case T_SELECTIVE: selective_tool(L, in_canvas); break;
 	case T_BRUSH: brush_tool(L, in_canvas); break;
 	case T_HEAL: heal_tool(L, in_canvas); break;
-	case T_VIGNETTE: case T_LENS: case T_TEXT: case T_GRAD: center_tool(L, in_canvas); break;
+	case T_LENS: area_tool(L, in_canvas, 1); break;
+	case T_VIGNETTE: case T_TEXT: case T_GRAD: center_tool(L, in_canvas); break;
 	case T_CURVES: case T_MIXER: break;
-	default: scrub_tool(L, in_canvas); break;
+	default:
+		if (L->area_on && maskable(L->tool) && area_tool(L, in_canvas, 0)) break;
+		scrub_tool(L, in_canvas);
+		break;
 	}
 }
 
@@ -22040,7 +22343,7 @@ static void draw_canvas(void) {
 		cursor_kind = 7;
 	}
 	if (in_canvas && wheel && !wheel_used) {
-		int size_tool = active >= 0 && (stack[active].tool == T_BRUSH || stack[active].tool == T_HEAL || stack[active].tool == T_SELECTIVE || stack[active].tool == T_LENS || stack[active].tool == T_GRAD);
+		int size_tool = active >= 0 && (stack[active].tool == T_BRUSH || stack[active].tool == T_HEAL || stack[active].tool == T_SELECTIVE || stack[active].tool == T_LENS || stack[active].tool == T_GRAD || stack[active].tool == T_VIGNETTE || (stack[active].area_on && !mask_edit));
 		if (!size_tool || mod_ctrl) {
 			view_zoom_at(powf(1.18f, (float)wheel), (float)mx, (float)my);
 			wheel_used = 1;
@@ -22049,6 +22352,11 @@ static void draw_canvas(void) {
 	/* image */
 	const Mips *m = &disp;
 	float z = zoom, cx = vcx, cy = vcy;
+	if (!space_cmp && lo_shown && disp.w[0] != out.w) { /* quick preview: small image stretched over the full-size view */
+		z = zoom * out.w / disp.w[0];
+		cx = vcx * disp.w[0] / out.w;
+		cy = vcy * disp.h[0] / out.h;
+	}
 	if (space_cmp && odisp.n) {
 		m = &odisp;
 		float ar = (float)odisp.w[0] / odisp.h[0], br = (float)out.w / out.h;
@@ -22122,7 +22430,7 @@ static void draw_canvas(void) {
 
 /* a value is being dragged (slider or on-canvas scrub): render on the half-size proxy meanwhile */
 static int g_force_lo = 0; /* benchmark hook */
-static int interacting_now(void) { return g_force_lo || (m_down[0] && (act_id != 0 || cdrag == 3)); }
+static int interacting_now(void) { return g_force_lo || (m_down[0] && (act_id != 0 || cdrag == 3 || (cdrag == 2 && (ag_mode != AG_NONE || ctr_drag)))); }
 static void pipeline_tick(void) {
 	if (lo_shown && !interacting_now()) need_render = 1; /* drag ended: do the full-quality render */
 }
@@ -22541,6 +22849,7 @@ static void draw_modal(void) {
 			{"Tab", "Show or hide the Looks strip"},
 			{"Ctrl+0 / Ctrl+1", "Fit to window / 100% (also double-click the photo)"},
 			{"Wheel", "Zoom at the cursor (Ctrl+wheel in brush tools)"},
+			{"Oval handles", "Lens Blur / Area: drag dots to resize, top dot rotates, Shift = circle, wheel pinches"},
 			{"Middle / right drag", "Pan (or Ctrl + left drag)"},
 			{"F1", "This help"},
 		};
@@ -22614,6 +22923,7 @@ static void frame_end(void) {
 	m_rel[0] = m_rel[1] = m_rel[2] = 0;
 	m_dbl = 0;
 	wheel = 0;
+	gest_dist = gest_theta = 0.f;
 	wheel_used = 0;
 	mdx = mdy = 0;
 	tf_enter = 0;
@@ -22836,6 +23146,13 @@ static void handle_event(SDL_Event *e) {
 		m_rel[b] = 1;
 		dirty = 1;
 	} break;
+	case SDL_MULTIGESTURE: /* two-finger pinch / twist on a touchscreen or trackpad */
+		if (e->mgesture.numFingers == 2) {
+			gest_dist += e->mgesture.dDist;
+			gest_theta += e->mgesture.dTheta;
+			dirty = 1;
+		}
+		break;
 	case SDL_MOUSEWHEEL:
 		wheel += e->wheel.y;
 		dirty = 1;
@@ -22967,7 +23284,7 @@ static int self_test(const char *in, const char *outdir) {
 static void shot_args(const char *a, const char *b, const char *c) { (void)a; (void)b; (void)c; }
 
 int main(int argc, char **argv) {
-	const char *in_path = NULL, *test_dir = NULL, *shot_path = NULL, *shot_tool = NULL, *shot_set = NULL;
+	const char *in_path = NULL, *test_dir = NULL, *shot_path = NULL, *shot_tool = NULL, *shot_set = NULL, *shot_area = NULL;
 	int shot_w = 1440, shot_h = 900, shot_looks = 1, shot_modal = 0;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--scale") && i + 1 < argc) ui_scale = (float)atof(argv[++i]);
@@ -22975,6 +23292,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shot_path = argv[++i];
 		else if (!strcmp(argv[i], "--tool") && i + 1 < argc) shot_tool = argv[++i];
 		else if (!strcmp(argv[i], "--set") && i + 1 < argc) shot_set = argv[++i];
+		else if (!strcmp(argv[i], "--area") && i + 1 < argc) shot_area = argv[++i];
 		else if (!strcmp(argv[i], "--size") && i + 2 < argc) {
 			shot_w = atoi(argv[++i]);
 			shot_h = atoi(argv[++i]);
@@ -23018,6 +23336,14 @@ int main(int argc, char **argv) {
 				if (strlen(TD[t].name) == strlen(shot_tool) && ends_with_ci(TD[t].name, shot_tool)) st_ = t;
 			if (st_ >= 0) select_tool(st_);
 			else tool_key(shot_tool[0]);
+			if (active >= 0 && shot_area) { /* ax,ay,rx,ry,rot-degrees */
+				float v[5] = {0.5f, 0.5f, 0.3f, 0.2f, 0};
+				sscanf(shot_area, "%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]);
+				Layer *Q = &stack[active];
+				Q->ax = v[0]; Q->ay = v[1]; Q->arx = v[2]; Q->ary = v[3]; Q->arot = v[4] * PI_F / 180.f;
+				Q->area_on = 1;
+				touch(Q);
+			}
 			if (active >= 0 && shot_set) {
 				char *s = strdup(shot_set), *tok = strtok(s, ",");
 				while (tok) {
@@ -23087,13 +23413,13 @@ int main(int argc, char **argv) {
 		if (quit_flag) break;
 		pipeline_tick();
 		if (need_render) pipeline_render();
+		/* pass 1: input only (nothing drawn); then render what changed; pass 2: draw once */
+		ui_dry = 1;
 		ui_frame();
+		ui_dry = 0;
 		frame_end();
-		if (need_render) {
-			pipeline_render();
-			ui_frame();
-			frame_end();
-		}
+		if (need_render) pipeline_render();
+		ui_frame();
 		apply_cursor();
 		present();
 		if (pending_export) run_pending_export();

@@ -547,12 +547,11 @@ static void apply_lens(const Layer *L, Img *im) {
 		memset(&c, 0, sizeof c);
 		c.w = w;
 		c.h = h;
-		c.cx = L->cx * w;
-		c.cy = L->cy * h;
-		float rf = (0.08f + L->p[LN_SIZE] / 100.f * 0.55f) * m;
-		c.a = rf * 1.35f;
-		c.b = rf * 0.85f;
-		float th = L->p[LN_ANGLE] * PI_F / 180.f;
+		c.cx = L->ax * w;
+		c.cy = L->ay * h;
+		c.a = L->arx * m;
+		c.b = L->ary * m;
+		float th = L->arot;
 		c.cs = cosf(th);
 		c.sn = sinf(th);
 		c.tw = 0.12f + L->p[LN_TRANS] / 100.f * 1.1f;

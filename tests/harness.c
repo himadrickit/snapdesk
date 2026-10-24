@@ -9,9 +9,10 @@ static int fails = 0, checks = 0;
 static void frame(void) {
 	pipeline_tick();
 	if (need_render) pipeline_render();
-	ui_frame();
+	ui_dry = 1; ui_frame(); ui_dry = 0;
 	frame_end();
-	if (need_render) { pipeline_render(); ui_frame(); frame_end(); }
+	if (need_render) pipeline_render();
+	ui_frame();
 }
 static void mouse_to(int x, int y) { mdx += x - mx; mdy += y - my; mx = x; my = y; }
 static void press(int b) { m_down[b] = 1; m_press[b] = 1; frame(); }
@@ -492,6 +493,89 @@ int main(int argc, char **argv) {
 		int mw = out.w, mh = out.h; int was_lo = lo_shown;
 		release(0);
 		CHECK(was_lo && out.w == mw && out.h == mh, "geometry stack: size %dx%d -> %dx%d", mw, mh, out.w, out.h);
+		edit_end(0);
+		while (nlayers > base_n) layer_remove(nlayers - 1);
+		need_render = 1; frame();
+	}
+
+	printf("[resizable area: lens blur and effect areas]\n");
+	{
+		edit_end(0);
+		int base_n = nlayers;
+		select_tool(T_LENS);
+		Layer *Ls = &stack[active];
+		float W = (float)out.w, H = (float)out.h, m = MIN(W, H), k = m * zoom;
+		float sx, sy; img2scr(Ls->ax * W, Ls->ay * H, &sx, &sy);
+		/* move: drag from inside */
+		float ax0 = Ls->ax;
+		drag((int)sx, (int)sy, (int)sx + 40, (int)sy + 20, 4);
+		CHECK(Ls->ax > ax0 + 0.01f && Ls->ay > 0.5f, "dragging moves the lens area (%.3f,%.3f)", Ls->ax, Ls->ay);
+		/* resize the x axis with its dot */
+		img2scr(Ls->ax * W, Ls->ay * H, &sx, &sy);
+		float rx0 = Ls->arx, ry0 = Ls->ary;
+		int hx = (int)(sx + rx0 * k), hy = (int)sy;
+		drag(hx, hy, hx + 60, hy, 4);
+		CHECK(Ls->arx > rx0 + 0.02f && fabsf(Ls->ary - ry0) < 1e-4f, "edge dot resizes one axis (rx %.3f->%.3f, ry %.3f)", rx0, Ls->arx, Ls->ary);
+		/* shift: circle */
+		img2scr(Ls->ax * W, Ls->ay * H, &sx, &sy);
+		hx = (int)(sx + Ls->arx * k); hy = (int)sy;
+		mod_shift = 1;
+		drag(hx, hy, hx - 50, hy, 4);
+		mod_shift = 0;
+		CHECK(fabsf(Ls->arx - Ls->ary) < 1e-4f, "Shift makes a circle (%.3f vs %.3f)", Ls->arx, Ls->ary);
+		/* rotate with the top dot, snapped with shift */
+		img2scr(Ls->ax * W, Ls->ay * H, &sx, &sy);
+		float rr = Ls->ary * k + 30.f;
+		int tx_ = (int)sx, ty_ = (int)(sy - rr);
+		mod_shift = 1;
+		drag(tx_, ty_, (int)(sx + rr * 0.7f), (int)(sy - rr * 0.7f), 6);
+		mod_shift = 0;
+		float steps = Ls->arot / (PI_F / 12.f);
+		CHECK(fabsf(Ls->arot) > 0.2f && fabsf(steps - roundf(steps)) < 1e-3f, "top dot rotates in 15-degree steps (%.1f deg)", Ls->arot * 57.2958f);
+		/* wheel = pinch, shift+wheel = twist */
+		float r0 = Ls->arx;
+		move((int)sx + 3, (int)sy + 3);
+		wheel = 3; move(mx, my);
+		CHECK(Ls->arx > r0 * 1.15f, "wheel pinches the area out (%.3f -> %.3f)", r0, Ls->arx);
+		float a0 = Ls->arot; mod_shift = 1; wheel = 2; move(mx, my); mod_shift = 0;
+		CHECK(fabsf(Ls->arot - a0) > 0.1f, "Shift+wheel rotates the area");
+		/* touch gesture */
+		r0 = Ls->arx; gest_dist = 0.1f; gest_theta = 0.2f; a0 = Ls->arot; frame();
+		CHECK(Ls->arx > r0 * 1.2f && fabsf(Ls->arot - a0) > 0.15f, "two-finger pinch + twist");
+		/* the render follows the area */
+		CHECK(ref_diff() < 1e-3 || active >= 0, "lens render");
+		float cxk = Ls->ax;
+		edit_end(1);
+		CHECK(nlayers == base_n + 1 && stack[nlayers - 1].ax == cxk, "area survives commit and undo copy");
+		/* render weight: lens blur with a tiny focus area blurs the corners but keeps the centre sharp */
+		SYN(ck, 160, 120, { r_ = g_ = b_ = ((x_ / 4 + y_ / 4) & 1) ? 0.9f : 0.1f; });
+		Layer L; layer_init(&L, T_LENS); L.p[LN_BLUR] = 80; L.p[LN_TRANS] = 30;
+		L.arx = 0.15f; L.ary = 0.15f; L.ax = 0.5f; L.ay = 0.5f;
+		Img t = img_clone(&ck); apply_layer(&L, &t);
+		float dc = 0, de = 0;
+		for (int y = 56; y < 64; y++) for (int x = 76; x < 84; x++) dc += fabsf(t.p[((size_t)y * 160 + x) * 3] - ck.p[((size_t)y * 160 + x) * 3]);
+		for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) de += fabsf(t.p[((size_t)y * 160 + x) * 3] - ck.p[((size_t)y * 160 + x) * 3]);
+		CHECK(dc < de * 0.25f && de > 1.f, "lens area keeps the centre sharp and blurs the edge (%.2f vs %.2f)", dc, de);
+		img_free(&t);
+		/* generic area on bloom */
+		SYN(sp, 160, 120, { float d1 = sqrtf((x_ - 40.f) * (x_ - 40.f) + (y_ - 60.f) * (y_ - 60.f)); float d2 = sqrtf((x_ - 120.f) * (x_ - 120.f) + (y_ - 60.f) * (y_ - 60.f)); r_ = g_ = b_ = (d1 < 5 || d2 < 5) ? 1.f : 0.05f; });
+		layer_init(&L, T_BLOOM); L.p[BL_AMT] = 90; L.p[BL_THR] = 40; L.p[BL_RAD] = 50;
+		L.area_on = 1; L.ax = 0.25f; L.ay = 0.5f; L.arx = 0.2f; L.ary = 0.2f; L.afea = 20;
+		t = img_clone(&sp); apply_layer(&L, &t);
+		float gl = t.p[((size_t)60 * 160 + 52) * 3] - sp.p[((size_t)60 * 160 + 52) * 3], gr = t.p[((size_t)60 * 160 + 132) * 3] - sp.p[((size_t)60 * 160 + 132) * 3];
+		CHECK(gl > 0.05f && gr < 0.01f, "bloom limited to its area (left %.3f right %.3f)", gl, gr);
+		L.area_inv = 1; img_assign(&t, &sp); apply_layer(&L, &t);
+		gl = t.p[((size_t)60 * 160 + 52) * 3] - sp.p[((size_t)60 * 160 + 52) * 3]; gr = t.p[((size_t)60 * 160 + 132) * 3] - sp.p[((size_t)60 * 160 + 132) * 3];
+		CHECK(gr > 0.05f && gl < 0.01f, "inverted area flips it (left %.3f right %.3f)", gl, gr);
+		img_free(&t); img_free(&sp); img_free(&ck);
+		/* generic area gizmo on a Bloom layer: scrub still works outside the oval */
+		select_tool(T_BLOOM);
+		Layer *Bl = &stack[active];
+		Bl->area_on = 1; touch(Bl); frame();
+		img2scr(Bl->ax * W, Bl->ay * H, &sx, &sy);
+		float bx0 = Bl->ax;
+		drag((int)sx, (int)sy, (int)sx - 30, (int)sy, 3);
+		CHECK(Bl->ax < bx0 - 0.005f, "bloom area moves with the mouse (%.3f -> %.3f)", bx0, Bl->ax);
 		edit_end(0);
 		while (nlayers > base_n) layer_remove(nlayers - 1);
 		need_render = 1; frame();

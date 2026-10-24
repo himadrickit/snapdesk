@@ -56,29 +56,44 @@ static const float *layer_mask(Layer *L, int w, int h) {
 	brt_raster(rt, L->mstr, L->nmstr, L->mpts);
 	return rt->map[0];
 }
-typedef struct { Img *im; const Img *before; const float *map; int inv, full; } MaskCtx;
+/* soft elliptical area weight (1 inside, 0 outside); axes in fractions of the short side */
+static inline float area_weight(const Layer *L, float x, float y, int w, int h, float m) {
+	float dx = x - L->ax * w, dy = y - L->ay * h, c = cosf(L->arot), s = sinf(L->arot);
+	float u = (dx * c + dy * s) / (L->arx * m), v = (-dx * s + dy * c) / (L->ary * m);
+	float d = sqrtf(u * u + v * v), f = 0.03f + 0.9f * L->afea / 100.f;
+	float k = 1.f - smoothf(1.f - f, 1.f + f * 0.3f, d);
+	return L->area_inv ? 1.f - k : k;
+}
+typedef struct { Img *im; const Img *before; const float *map; const Layer *L; int inv, use_mask, use_area; } MaskCtx;
 static void mask_job(void *v, int y0, int y1) {
 	MaskCtx *c = (MaskCtx *)v;
-	int w = c->im->w;
+	int w = c->im->w, h = c->im->h;
+	float m = (float)MIN(w, h);
 	for (int y = y0; y < y1; y++) {
 		float *p = c->im->p + (size_t)y * w * 3;
 		const float *q = c->before->p + (size_t)y * w * 3;
 		for (int x = 0; x < w; x++, p += 3, q += 3) {
-			float a = c->full ? 1.f : (c->map ? CL01(c->map[(size_t)y * w + x]) : 0.f);
-			if (c->inv) a = 1.f - a;
+			float a = 1.f;
+			if (c->use_mask) {
+				a = c->map ? CL01(c->map[(size_t)y * w + x]) : 0.f;
+				if (c->inv) a = 1.f - a;
+			}
+			if (c->use_area) a *= area_weight(c->L, x + 0.5f, y + 0.5f, w, h, m);
 			for (int k = 0; k < 3; k++) p[k] = LERP(q[k], p[k], a);
 		}
 	}
 }
+static inline int uses_area(const Layer *L) { return L->area_on && L->tool != T_LENS && maskable(L->tool); }
 static void apply_layer(Layer *L, Img *im) {
-	if (!L->mask_on || !maskable(L->tool)) {
+	int um = L->mask_on && maskable(L->tool), ua = uses_area(L);
+	if (!um && !ua) {
 		apply_layer_raw(L, im);
 		return;
 	}
 	Img before = img_clone(im);
 	apply_layer_raw(L, im);
 	if (im->w == before.w && im->h == before.h) {
-		MaskCtx c = {im, &before, layer_mask(L, im->w, im->h), L->mask_inv, 0};
+		MaskCtx c = {im, &before, um ? layer_mask(L, im->w, im->h) : NULL, L, L->mask_inv, um, ua};
 		parallel(mask_job, &c, im->h);
 	}
 	img_free(&before);

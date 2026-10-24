@@ -20,7 +20,7 @@ enum { BR_MODE, BR_STR, BR_SIZE, BR_HARD, BR_FLOW };
 enum { HE_SIZE };
 enum { PO_SMOOTH, PO_BRIGHT, PO_WARM };
 enum { VG_OUTER, VG_INNER, VG_SIZE, VG_FEATHER, VG_ROUND };
-enum { LN_SHAPE, LN_BLUR, LN_TRANS, LN_SIZE, LN_ANGLE, LN_VIG };
+enum { LN_SHAPE, LN_BLUR, LN_TRANS, LN_VIG };
 enum { TX_SIZE, TX_COLOR, TX_OPAC, TX_STYLE, TX_ROT };
 enum { FR_STYLE, FR_WIDTH, FR_COLOR, FR_CORNER };
 enum { BW_FILTER, BW_TONE, BW_BRI, BW_CON, BW_GRAIN };
@@ -74,7 +74,7 @@ static const ToolDef TD[T_COUNT] = {
 	[T_HEAL] = {"Healing", "RETOUCH", 'H', 1, {SL("Size", 3, 100, 25)}},
 	[T_PORTRAIT] = {"Portrait", "RETOUCH", 'O', 3, {SL("Skin Smoothing", 0, 100, 40), SL("Face Brighten", 0, 100, 0), SL("Skin Warmth", -100, 100, 0)}},
 	[T_VIGNETTE] = {"Vignette", "RETOUCH", 'G', 5, {SL("Outer Brightness", -100, 100, -50), SL("Inner Brightness", -100, 100, 0), SL("Size", 0, 100, 50), SL("Feather", 0, 100, 60), SL("Roundness", -100, 100, 0)}},
-	[T_LENS] = {"Lens Blur", "RETOUCH", 'L', 6, {CHO("Shape", "Elliptical|Linear"), SL("Blur", 0, 100, 50), SL("Transition", 0, 100, 50), SL("Focus Size", 0, 100, 40), SL("Angle", -90, 90, 0), SL("Vignette", 0, 100, 0)}},
+	[T_LENS] = {"Lens Blur", "RETOUCH", 'L', 4, {CHO("Shape", "Elliptical|Linear"), SL("Blur", 0, 100, 50), SL("Transition", 0, 100, 50), SL("Vignette", 0, 100, 0)}},
 	[T_TEXT] = {"Text", "RETOUCH", 'X', 5, {SL("Size", 1, 100, 30), CHO("Color", "White|Black|Red|Yellow|Teal|Blue|Pink"), SL("Opacity", 0, 100, 100), CHO("Style", "Normal|Outline|Shadow|Plate"), SL("Rotation", -180, 180, 0)}},
 	[T_FRAME] = {"Frames", "RETOUCH", 'F', 4, {CHO("Style", "Solid|Polaroid|Double|Inset"), SL("Width", 0, 100, 20), CHO("Color", "White|Black|Gray|Cream|Ink|Sand"), SL("Corners", 0, 100, 0)}},
 	[T_BW] = {"Black & White", "FILTERS", '1', 5, {CHO("Filter", "Neutral|Red|Orange|Yellow|Green|Blue"), CHO("Tone", "None|Sepia|Cool|Gold|Selenium"), SL("Brightness", -100, 100, 0), SL("Contrast", -100, 100, 20), SL("Grain", 0, 100, 0)}},
@@ -155,6 +155,8 @@ typedef struct Layer {
 	float mix[8][3]; /* colour mixer: hue, saturation, luminance per colour band */
 	char text[96];
 	char path[1024]; /* double exposure: second photo */
+	int area_on, area_inv; /* movable / resizable / rotatable elliptical area that limits the effect */
+	float ax, ay, arx, ary, arot, afea; /* centre (0..1), half-axes (fractions of the short side), rotation (rad), feather (0..100) */
 	int mask_on, mask_inv; /* per-layer mask: strokes paint where the effect shows */
 	Pt *mpts;
 	int nmpts, cmpts;
@@ -178,6 +180,13 @@ static void layer_params_default(Layer *L) {
 	const ToolDef *d = &TD[L->tool];
 	for (int i = 0; i < d->np; i++) L->p[i] = d->p[i].def;
 }
+static void area_reset(Layer *L) {
+	L->ax = L->ay = 0.5f;
+	L->arx = L->tool == T_LENS ? 0.405f : 0.32f;
+	L->ary = L->tool == T_LENS ? 0.255f : 0.22f;
+	L->arot = 0.f;
+	L->afea = 45.f;
+}
 static void layer_init(Layer *L, int tool) {
 	memset(L, 0, sizeof *L);
 	L->tool = tool;
@@ -189,6 +198,8 @@ static void layer_init(Layer *L, int tool) {
 	L->cr[2] = L->cr[3] = 1;
 	for (int c = 0; c < 4; c++) curves_reset(L, c);
 	layer_params_default(L);
+	area_reset(L);
+	if (tool == T_LENS) L->area_on = 1;
 	layer_bump(L);
 }
 static void brt_free(BrushRT *rt);

@@ -344,7 +344,9 @@ static void heal_tool(Layer *L, int in_canvas) {
 }
 
 /* vignette / lens / text: drag the centre */
+static int ctr_drag = 0; /* a centre / position drag is in progress (quick preview applies) */
 static void center_tool(Layer *L, int in_canvas) {
+	ctr_drag = cdrag == 2;
 	float W = (float)out.w, H = (float)out.h, m = MIN(W, H);
 	float ix, iy;
 	scr2img((float)mx, (float)my, &ix, &iy);
@@ -368,8 +370,8 @@ static void center_tool(Layer *L, int in_canvas) {
 		} else
 			cdrag = 0;
 	}
-	if (in_canvas && wheel && !mod_ctrl && !wheel_used && L->tool == T_LENS) {
-		L->p[LN_SIZE] = CLAMP(L->p[LN_SIZE] + wheel * 3.f, 0.f, 100.f);
+	if (in_canvas && wheel && !mod_ctrl && !wheel_used && L->tool == T_VIGNETTE) {
+		L->p[VG_SIZE] = CLAMP(L->p[VG_SIZE] + wheel * 3.f, 0.f, 100.f);
 		wheel_used = 1;
 		touch(L);
 	}
@@ -396,14 +398,6 @@ static void center_tool(Layer *L, int in_canvas) {
 	if (L->tool == T_VIGNETTE) {
 		float inner = L->p[VG_SIZE] / 100.f * 0.85f;
 		ellipse_ring(sx, sy, inner * W * 0.5f / 0.7071f * zoom, inner * H * 0.5f / 0.7071f * zoom, 0, 1.4f, 0xffffff, 0.8f, 1);
-	} else if (L->tool == T_LENS) {
-		float rf = (0.08f + L->p[LN_SIZE] / 100.f * 0.55f) * m * zoom, th = L->p[LN_ANGLE] * PI_F / 180.f;
-		if ((int)L->p[LN_SHAPE] == 0)
-			ellipse_ring(sx, sy, rf * 1.35f, rf * 0.85f, th, 1.4f, 0xffffff, 0.85f, 1);
-		else {
-			float nx = -sinf(th), ny = cosf(th), tx = cosf(th), ty = sinf(th), L2 = 3000.f;
-			for (int s = -1; s <= 1; s += 2) line_aa(sx + nx * rf * 0.85f * s - tx * L2, sy + ny * rf * 0.85f * s - ty * L2, sx + nx * rf * 0.85f * s + tx * L2, sy + ny * rf * 0.85f * s + ty * L2, 1.4f, 0xffffff, 0.8f);
-		}
 	} else if (L->tool == T_TEXT) {
 		float px = MAX(6.f, L->p[TX_SIZE] / 100.f * 0.34f * m) * zoom;
 		float tw = text_width(L->text, 14, 1) / 14.f * px * 1.02f, th = px * 1.25f, a = L->p[TX_ROT] * PI_F / 180.f;
@@ -502,6 +496,154 @@ static void scrub_tool(Layer *L, int in_canvas) {
 	if (in_canvas || cdrag == 3) cursor_kind = scrub_axis == 2 ? 3 : (n > 0 ? 4 : 0);
 }
 
+
+/* ---- movable / resizable / rotatable oval (Lens Blur focus, or the Area of any effect) ----
+ * drag inside = move, edge dots = resize (Shift = circle), top dot = rotate (Shift = 15 degree steps),
+ * wheel = pinch in/out, Shift+wheel = rotate, two-finger pinch/twist on touch. Returns 1 if it used the mouse. */
+enum { AG_NONE, AG_MOVE, AG_RX, AG_RY, AG_ROT };
+static int ag_mode = AG_NONE, ag_hot = AG_NONE;
+static float ag_gx, ag_gy;
+static void area_clamp(Layer *L) {
+	L->arx = CLAMP(L->arx, 0.02f, 1.6f);
+	L->ary = CLAMP(L->ary, 0.02f, 1.6f);
+	L->ax = CLAMP(L->ax, -0.2f, 1.2f);
+	L->ay = CLAMP(L->ay, -0.2f, 1.2f);
+	while (L->arot > PI_F) L->arot -= 2.f * PI_F;
+	while (L->arot < -PI_F) L->arot += 2.f * PI_F;
+}
+static int area_tool(Layer *L, int in_canvas, int grab_anywhere) {
+	float W = (float)out.w, H = (float)out.h, m = MIN(W, H);
+	int linear = L->tool == T_LENS && (int)L->p[LN_SHAPE] == 1;
+	float k = m * zoom, ca = cosf(L->arot), sa = sinf(L->arot);
+	float sx, sy;
+	img2scr(L->ax * W, L->ay * H, &sx, &sy);
+	float exx = ca, exy = sa, eyx = -sa, eyy = ca; /* screen-space axes */
+	float rx = L->arx * k, ry = L->ary * k;
+	float hx[4][2] = {{sx + exx * rx, sy + exy * rx}, {sx - exx * rx, sy - exy * rx}, {sx + eyx * ry, sy + eyy * ry}, {sx - eyx * ry, sy - eyy * ry}};
+	float stem = ry + 30.f, rot_x = sx - eyx * stem, rot_y = sy - eyy * stem;
+	int used = 0;
+	/* hit-testing */
+	int hit = AG_NONE;
+	if (in_canvas || cdrag == 2) {
+		float R2 = 11.f * 11.f;
+		float dxm = (float)mx - sx, dym = (float)my - sy;
+		if ((mx - rot_x) * (mx - rot_x) + (my - rot_y) * (my - rot_y) < R2) hit = AG_ROT;
+		else if (!linear && ((mx - hx[0][0]) * (mx - hx[0][0]) + (my - hx[0][1]) * (my - hx[0][1]) < R2 || (mx - hx[1][0]) * (mx - hx[1][0]) + (my - hx[1][1]) * (my - hx[1][1]) < R2)) hit = AG_RX;
+		else if ((mx - hx[2][0]) * (mx - hx[2][0]) + (my - hx[2][1]) * (my - hx[2][1]) < R2 || (mx - hx[3][0]) * (mx - hx[3][0]) + (my - hx[3][1]) * (my - hx[3][1]) < R2) hit = AG_RY;
+		else {
+			float u = (dxm * exx + dym * exy) / MAX(rx, 1.f), v = (dxm * eyx + dym * eyy) / MAX(ry, 1.f);
+			if (grab_anywhere || (!linear && u * u + v * v <= 1.f) || (linear && fabsf(v) <= 1.f)) hit = AG_MOVE;
+		}
+	}
+	if (cdrag == 0) ag_hot = hit;
+	if (in_canvas && cdrag == 0 && m_press[0] && !mod_ctrl && hit != AG_NONE) {
+		ag_mode = hit;
+		cdrag = 2;
+		float ix, iy;
+		scr2img((float)mx, (float)my, &ix, &iy);
+		ag_gx = L->ax - ix / W;
+		ag_gy = L->ay - iy / H;
+	}
+	if (cdrag == 2 && ag_mode != AG_NONE) {
+		used = 1;
+		if (m_down[0]) {
+			float ix, iy;
+			scr2img((float)mx, (float)my, &ix, &iy);
+			float dx = ix - L->ax * W, dy = iy - L->ay * H;
+			switch (ag_mode) {
+			case AG_MOVE:
+				L->ax = ix / W + ag_gx;
+				L->ay = iy / H + ag_gy;
+				break;
+			case AG_RX: {
+				float r = fabsf(dx * ca + dy * sa) / m;
+				L->arx = r;
+				if (mod_shift) L->ary = r;
+			} break;
+			case AG_RY: {
+				float r = fabsf(-dx * sa + dy * ca) / m;
+				L->ary = r;
+				if (mod_shift && !linear) L->arx = r;
+			} break;
+			case AG_ROT: {
+				float a = atan2f(dy, dx) + PI_F * 0.5f;
+				if (mod_shift) a = roundf(a / (PI_F / 12.f)) * (PI_F / 12.f);
+				L->arot = a;
+			} break;
+			}
+			area_clamp(L);
+			touch(L);
+		} else {
+			cdrag = 0;
+			ag_mode = AG_NONE;
+		}
+	}
+	/* wheel = pinch, Shift+wheel = twist; touch gestures do the same */
+	if (in_canvas && wheel && !mod_ctrl && !wheel_used) {
+		if (mod_shift) L->arot += wheel * 5.f * PI_F / 180.f;
+		else {
+			float f = powf(1.07f, (float)wheel);
+			L->arx *= f;
+			L->ary *= f;
+		}
+		area_clamp(L);
+		wheel_used = 1;
+		touch(L);
+	}
+	if (in_canvas && (gest_dist != 0.f || gest_theta != 0.f)) {
+		float f = 1.f + gest_dist * 3.f;
+		L->arx *= f;
+		L->ary *= f;
+		L->arot += gest_theta;
+		area_clamp(L);
+		touch(L);
+	}
+	/* drawing */
+	Clip c = clip_push(cvx, cvy, cvw, cvh);
+	img2scr(L->ax * W, L->ay * H, &sx, &sy);
+	rx = L->arx * k;
+	ry = L->ary * k;
+	ca = cosf(L->arot);
+	sa = sinf(L->arot);
+	exx = ca; exy = sa; eyx = -sa; eyy = ca;
+	float fea = L->tool == T_LENS ? (0.12f + L->p[LN_TRANS] / 100.f * 1.1f) * 0.5f : (0.03f + 0.9f * L->afea / 100.f);
+	hx[0][0] = sx + exx * rx; hx[0][1] = sy + exy * rx; hx[1][0] = sx - exx * rx; hx[1][1] = sy - exy * rx;
+	hx[2][0] = sx + eyx * ry; hx[2][1] = sy + eyy * ry; hx[3][0] = sx - eyx * ry; hx[3][1] = sy - eyy * ry;
+	rot_x = sx - eyx * (ry + 30.f);
+	rot_y = sy - eyy * (ry + 30.f);
+	if (!linear) {
+		ellipse_ring(sx, sy, rx, ry, L->arot, 1.6f, 0xffffff, 0.9f, 0);
+		float fo = 1.f + MIN(fea, 1.5f) * 0.3f, fi = MAX(0.08f, 1.f - MIN(fea, 0.92f));
+		ellipse_ring(sx, sy, rx * fo, ry * fo, L->arot, 1.f, 0xffffff, 0.4f, 1);
+		ellipse_ring(sx, sy, rx * fi, ry * fi, L->arot, 1.f, 0xffffff, 0.3f, 1);
+	} else {
+		float Lh = 3000.f;
+		for (int s = -1; s <= 1; s += 2) line_aa(sx + eyx * ry * s - exx * Lh, sy + eyy * ry * s - exy * Lh, sx + eyx * ry * s + exx * Lh, sy + eyy * ry * s + exy * Lh, 1.6f, 0xffffff, 0.85f);
+		for (int s = -1; s <= 1; s += 2) {
+			float o = ry * (1.f + fea * 0.6f) * s;
+			line_aa(sx + eyx * o - exx * Lh, sy + eyy * o - exy * Lh, sx + eyx * o + exx * Lh, sy + eyy * o + exy * Lh, 1.f, 0xffffff, 0.3f);
+		}
+	}
+	line_aa(hx[3][0], hx[3][1], rot_x, rot_y, 1.2f, 0xffffff, 0.6f);
+	for (int i = 0; i < 4; i++) {
+		if (linear && i < 2) continue;
+		int hot = (ag_hot == AG_RX && i < 2) || (ag_hot == AG_RY && i >= 2);
+		disc(hx[i][0], hx[i][1], hot ? 8.f : 6.5f, 0x000000, 0.45f);
+		disc(hx[i][0], hx[i][1], hot ? 6.5f : 5.f, hot ? C_ACC : 0xffffff, 1);
+	}
+	disc(rot_x, rot_y, ag_hot == AG_ROT ? 8.f : 6.5f, 0x000000, 0.45f);
+	disc(rot_x, rot_y, ag_hot == AG_ROT ? 6.5f : 5.f, C_ACC, 1);
+	ring(rot_x, rot_y, 8.5f, 1.f, 0xffffff, 0.6f);
+	disc(sx, sy, 5.f, 0x000000, 0.4f);
+	disc(sx, sy, 4.f, C_ACC, 1);
+	clip_set(c);
+	if (in_canvas || cdrag == 2) {
+		int mode = cdrag == 2 ? ag_mode : ag_hot;
+		cursor_kind = mode == AG_ROT ? 7 : (mode == AG_RX ? 4 : (mode == AG_RY ? 3 : (mode == AG_MOVE ? 2 : 0)));
+		if (cursor_kind == 0 && !used) return 0;
+	}
+	return used || ag_hot != AG_NONE || cdrag == 2;
+}
 static int mask_for = -1;
 static void mask_tool(Layer *L, int in_canvas) {
 	float W = (float)out.w, H = (float)out.h, m = MIN(W, H);
@@ -584,9 +726,13 @@ static void canvas_tool(int in_canvas) {
 	case T_SELECTIVE: selective_tool(L, in_canvas); break;
 	case T_BRUSH: brush_tool(L, in_canvas); break;
 	case T_HEAL: heal_tool(L, in_canvas); break;
-	case T_VIGNETTE: case T_LENS: case T_TEXT: case T_GRAD: center_tool(L, in_canvas); break;
+	case T_LENS: area_tool(L, in_canvas, 1); break;
+	case T_VIGNETTE: case T_TEXT: case T_GRAD: center_tool(L, in_canvas); break;
 	case T_CURVES: case T_MIXER: break;
-	default: scrub_tool(L, in_canvas); break;
+	default:
+		if (L->area_on && maskable(L->tool) && area_tool(L, in_canvas, 0)) break;
+		scrub_tool(L, in_canvas);
+		break;
 	}
 }
 
@@ -641,7 +787,7 @@ static void draw_canvas(void) {
 		cursor_kind = 7;
 	}
 	if (in_canvas && wheel && !wheel_used) {
-		int size_tool = active >= 0 && (stack[active].tool == T_BRUSH || stack[active].tool == T_HEAL || stack[active].tool == T_SELECTIVE || stack[active].tool == T_LENS || stack[active].tool == T_GRAD);
+		int size_tool = active >= 0 && (stack[active].tool == T_BRUSH || stack[active].tool == T_HEAL || stack[active].tool == T_SELECTIVE || stack[active].tool == T_LENS || stack[active].tool == T_GRAD || stack[active].tool == T_VIGNETTE || (stack[active].area_on && !mask_edit));
 		if (!size_tool || mod_ctrl) {
 			view_zoom_at(powf(1.18f, (float)wheel), (float)mx, (float)my);
 			wheel_used = 1;
@@ -650,6 +796,11 @@ static void draw_canvas(void) {
 	/* image */
 	const Mips *m = &disp;
 	float z = zoom, cx = vcx, cy = vcy;
+	if (!space_cmp && lo_shown && disp.w[0] != out.w) { /* quick preview: small image stretched over the full-size view */
+		z = zoom * out.w / disp.w[0];
+		cx = vcx * disp.w[0] / out.w;
+		cy = vcy * disp.h[0] / out.h;
+	}
 	if (space_cmp && odisp.n) {
 		m = &odisp;
 		float ar = (float)odisp.w[0] / odisp.h[0], br = (float)out.w / out.h;
@@ -723,7 +874,7 @@ static void draw_canvas(void) {
 
 /* a value is being dragged (slider or on-canvas scrub): render on the half-size proxy meanwhile */
 static int g_force_lo = 0; /* benchmark hook */
-static int interacting_now(void) { return g_force_lo || (m_down[0] && (act_id != 0 || cdrag == 3)); }
+static int interacting_now(void) { return g_force_lo || (m_down[0] && (act_id != 0 || cdrag == 3 || (cdrag == 2 && (ag_mode != AG_NONE || ctr_drag)))); }
 static void pipeline_tick(void) {
 	if (lo_shown && !interacting_now()) need_render = 1; /* drag ended: do the full-quality render */
 }

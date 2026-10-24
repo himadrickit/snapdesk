@@ -8,7 +8,7 @@ typedef struct {
 	uint8_t *rgb; /* source pixels, EXIF-oriented, RGB8 */
 	int w, h;
 	Img proxy; /* float preview-resolution copy of the source */
-	Img proxy_lo; /* half-size copy used while a slider / scrub is being dragged */
+	Img proxy_lo, proxy_lo4; /* half-size and quarter-size copies used while a value is being dragged */
 	int proxy_max;
 	uint32_t proxy_gen;
 	int loaded;
@@ -113,7 +113,7 @@ static Img pf, out;
 static int pf_ok = 0, pf_k = -1, out_ok = 0;
 /* drag-time quick preview: the same stack rendered on a half-size proxy, then upscaled */
 static Img pfL, outL;
-static int pfL_ok = 0, pfL_k = -1, outL_ok = 0, lo_shown = 0;
+static int pfL_ok = 0, pfL_k = -1, outL_ok = 0, lo_shown = 0, pfL_level = 0, lo_level = 1;
 static uint64_t pfL_sig = 0, outL_sig = 0;
 static int interacting_now(void);
 static double full_ms = 0; /* cost of the last full-quality render: the quick preview is only used when it is high */
@@ -152,13 +152,19 @@ static void pipeline_invalidate(void) {
 }
 static double now_ms(void) { return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(); }
 
-static void pipeline_render_lo(int n, int K) {
+static void pipeline_render_lo(int n, int K, int level) {
+	if (level != pfL_level) {
+		pfL_ok = 0;
+		outL_ok = 0;
+		pfL_level = level;
+	}
+	const Img *base = level == 2 ? &doc.proxy_lo4 : &doc.proxy_lo;
 	uint64_t sigK = stack_sig(K);
 	if (!(pfL_ok && pfL_k == K && pfL_sig == sigK)) {
 		if (outL_ok && K == n && outL_sig == sigK)
 			img_assign(&pfL, &outL);
 		else {
-			img_assign(&pfL, &doc.proxy_lo);
+			img_assign(&pfL, base);
 			for (int i = 0; i < K; i++)
 				if (eff_visible(i)) apply_layer(&stack[i], &pfL);
 		}
@@ -174,16 +180,20 @@ static void pipeline_render_lo(int n, int K) {
 		outL_sig = sigN;
 		outL_ok = 1;
 	}
-	/* upscale to exactly the size the full-quality render will have, so the view does not jump */
+	/* `out` keeps the size the full-quality render has; if that is unchanged the small result is shown
+	 * directly (the canvas scales it), otherwise it is upscaled once so the view does not jump */
 	int ew = doc.proxy.w, eh = doc.proxy.h;
 	for (int i = 0; i < n; i++)
 		if (eff_visible(i)) layer_outdims(&stack[i], &ew, &eh);
-	Img up = (outL.w == ew && outL.h == eh) ? img_clone(&outL) : resize_f(&outL, ew, eh);
-	img_free(&out);
-	out = up;
-	out_ok = 0; /* `out` is not full quality now */
+	if (!(out.p && out.w == ew && out.h == eh)) {
+		Img up = resize_f(&outL, ew, eh);
+		img_free(&out);
+		out = up;
+		mips_from_img(&disp, &out);
+	} else
+		mips_from_img(&disp, &outL);
+	out_ok = 0; /* `out` is not up to date now */
 	lo_shown = 1;
-	mips_from_img(&disp, &out);
 	compute_histogram(&disp);
 	render_serial++;
 }
@@ -192,8 +202,9 @@ static void pipeline_render(void) {
 	double t0 = now_ms();
 	int n = nlayers;
 	int K = active >= 0 ? active : n;
-	if (doc.proxy_lo.p && full_ms > 45.0 && interacting_now()) {
-		pipeline_render_lo(n, K);
+	if (doc.proxy_lo.p && full_ms > 25.0 && interacting_now()) {
+		if (!lo_shown) lo_level = (full_ms * 0.25 > 28.0 && doc.proxy_lo4.p) ? 2 : 1; /* heavier tool: smaller preview */
+		pipeline_render_lo(n, K, lo_level);
 		need_render = 0;
 		last_render_ms = now_ms() - t0;
 		return;
@@ -439,7 +450,7 @@ static int look_saveable(const Layer *L) {
 	switch (L->tool) {
 	case T_CROP: case T_ROTATE: case T_PERSP: case T_EXPAND: case T_BRUSH: case T_HEAL: case T_SELECTIVE: case T_TEXT: case T_DOUBLE: return 0;
 	}
-	return !L->mask_on;
+	return !L->mask_on && !(L->area_on && L->tool != T_LENS);
 }
 static char *looks_file(char *buf, size_t cap) {
 	char *pd = SDL_GetPrefPath("snapdesk", "snapdesk");
@@ -674,7 +685,11 @@ static void proxy_build(void) {
 	}
 	doc.proxy = resize_u8(doc.rgb, doc.w, doc.h, tw, th);
 	img_free(&doc.proxy_lo);
-	if ((long)tw * th > proxy_lo_min) doc.proxy_lo = resize_f(&doc.proxy, MAX(1, (tw + 1) / 2), MAX(1, (th + 1) / 2));
+	img_free(&doc.proxy_lo4);
+	if ((long)tw * th > proxy_lo_min) {
+		doc.proxy_lo = resize_f(&doc.proxy, MAX(1, (tw + 1) / 2), MAX(1, (th + 1) / 2));
+		doc.proxy_lo4 = resize_f(&doc.proxy, MAX(1, (tw + 3) / 4), MAX(1, (th + 3) / 4));
+	}
 	doc.proxy_gen++;
 	mips_from_img(&odisp, &doc.proxy);
 	pipeline_invalidate();

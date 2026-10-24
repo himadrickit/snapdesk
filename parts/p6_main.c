@@ -413,6 +413,7 @@ static void draw_modal(void) {
 			{"Tab", "Show or hide the Looks strip"},
 			{"Ctrl+0 / Ctrl+1", "Fit to window / 100% (also double-click the photo)"},
 			{"Wheel", "Zoom at the cursor (Ctrl+wheel in brush tools)"},
+			{"Oval handles", "Lens Blur / Area: drag dots to resize, top dot rotates, Shift = circle, wheel pinches"},
 			{"Middle / right drag", "Pan (or Ctrl + left drag)"},
 			{"F1", "This help"},
 		};
@@ -486,6 +487,7 @@ static void frame_end(void) {
 	m_rel[0] = m_rel[1] = m_rel[2] = 0;
 	m_dbl = 0;
 	wheel = 0;
+	gest_dist = gest_theta = 0.f;
 	wheel_used = 0;
 	mdx = mdy = 0;
 	tf_enter = 0;
@@ -708,6 +710,13 @@ static void handle_event(SDL_Event *e) {
 		m_rel[b] = 1;
 		dirty = 1;
 	} break;
+	case SDL_MULTIGESTURE: /* two-finger pinch / twist on a touchscreen or trackpad */
+		if (e->mgesture.numFingers == 2) {
+			gest_dist += e->mgesture.dDist;
+			gest_theta += e->mgesture.dTheta;
+			dirty = 1;
+		}
+		break;
 	case SDL_MOUSEWHEEL:
 		wheel += e->wheel.y;
 		dirty = 1;
@@ -839,7 +848,7 @@ static int self_test(const char *in, const char *outdir) {
 static void shot_args(const char *a, const char *b, const char *c) { (void)a; (void)b; (void)c; }
 
 int main(int argc, char **argv) {
-	const char *in_path = NULL, *test_dir = NULL, *shot_path = NULL, *shot_tool = NULL, *shot_set = NULL;
+	const char *in_path = NULL, *test_dir = NULL, *shot_path = NULL, *shot_tool = NULL, *shot_set = NULL, *shot_area = NULL;
 	int shot_w = 1440, shot_h = 900, shot_looks = 1, shot_modal = 0;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--scale") && i + 1 < argc) ui_scale = (float)atof(argv[++i]);
@@ -847,6 +856,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shot_path = argv[++i];
 		else if (!strcmp(argv[i], "--tool") && i + 1 < argc) shot_tool = argv[++i];
 		else if (!strcmp(argv[i], "--set") && i + 1 < argc) shot_set = argv[++i];
+		else if (!strcmp(argv[i], "--area") && i + 1 < argc) shot_area = argv[++i];
 		else if (!strcmp(argv[i], "--size") && i + 2 < argc) {
 			shot_w = atoi(argv[++i]);
 			shot_h = atoi(argv[++i]);
@@ -890,6 +900,14 @@ int main(int argc, char **argv) {
 				if (strlen(TD[t].name) == strlen(shot_tool) && ends_with_ci(TD[t].name, shot_tool)) st_ = t;
 			if (st_ >= 0) select_tool(st_);
 			else tool_key(shot_tool[0]);
+			if (active >= 0 && shot_area) { /* ax,ay,rx,ry,rot-degrees */
+				float v[5] = {0.5f, 0.5f, 0.3f, 0.2f, 0};
+				sscanf(shot_area, "%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]);
+				Layer *Q = &stack[active];
+				Q->ax = v[0]; Q->ay = v[1]; Q->arx = v[2]; Q->ary = v[3]; Q->arot = v[4] * PI_F / 180.f;
+				Q->area_on = 1;
+				touch(Q);
+			}
 			if (active >= 0 && shot_set) {
 				char *s = strdup(shot_set), *tok = strtok(s, ",");
 				while (tok) {
@@ -959,13 +977,13 @@ int main(int argc, char **argv) {
 		if (quit_flag) break;
 		pipeline_tick();
 		if (need_render) pipeline_render();
+		/* pass 1: input only (nothing drawn); then render what changed; pass 2: draw once */
+		ui_dry = 1;
 		ui_frame();
+		ui_dry = 0;
 		frame_end();
-		if (need_render) {
-			pipeline_render();
-			ui_frame();
-			frame_end();
-		}
+		if (need_render) pipeline_render();
+		ui_frame();
 		apply_cursor();
 		present();
 		if (pending_export) run_pending_export();

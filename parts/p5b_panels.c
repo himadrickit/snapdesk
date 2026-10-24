@@ -118,6 +118,7 @@ static void layer_reset(Layer *L) {
 	case T_VIGNETTE:
 	case T_LENS:
 		L->cx = L->cy = 0.5f;
+		area_reset(L);
 		layer_params_default(L);
 		break;
 	case T_GRAD:
@@ -297,7 +298,8 @@ static void draw_looks(int x, int y, int w, int h) {
 			toast("Look deleted");
 			break;
 		}
-		if (lt_have[i] && lthumb[i]) {
+		if (ui_dry) {
+		} else if (lt_have[i] && lthumb[i]) {
 			for (int j = 0; j < LT_H; j++) memcpy(&fb[(size_t)(by + j) * FW + bx], &lthumb[i][j * LT_W], LT_W * 4);
 		} else
 			fill_rect(bx, by, LT_W, LT_H, C_PANEL2, 1);
@@ -433,6 +435,42 @@ static void mask_clear(Layer *L) {
 		L->mrt = NULL;
 	}
 	touch(L);
+}
+static void area_section(Layer *L, int x, int *py, int w) {
+	if (!maskable(L->tool) || L->tool == T_LENS) return;
+	*py += 6;
+	fill_rect(x, *py, w, 1, C_LINE, 1);
+	*py += 10;
+	text((float)x, *py + 8, "AREA", 11, 1, C_DIM, 1);
+	if (button(4930, x + w - 64, *py - 2, 64, 22, L->area_on ? "On" : "Off", L->area_on ? BS_ACCENT : BS_NORMAL, 0)) {
+		L->area_on ^= 1;
+		if (L->area_on && !L->touched) L->touched = 1;
+		touch(L);
+	}
+	*py += 28;
+	if (!L->area_on) {
+		hint_text(x, py, w, "Limit this effect to a movable, resizable, rotatable oval.");
+		return;
+	}
+	int bw = (w - 10) / 3;
+	if (button(4931, x, *py, bw, 24, "Circle", BS_NORMAL, 0)) {
+		float r = sqrtf(L->arx * L->ary);
+		L->arx = L->ary = r;
+		L->arot = 0.f;
+		touch(L);
+	}
+	if (button(4932, x + bw + 5, *py, bw, 24, "Invert", BS_NORMAL, L->area_inv)) {
+		L->area_inv ^= 1;
+		touch(L);
+	}
+	if (button(4933, x + 2 * (bw + 5), *py, bw, 24, "Reset", BS_NORMAL, 0)) {
+		area_reset(L);
+		touch(L);
+	}
+	*py += 32;
+	if (slider(4934, x, *py, w, "Feather", &L->afea, 0, 100, 45, 0, 0) & 1) touch(L);
+	*py += 42;
+	hint_text(x, py, w, "Drag inside to move, edge dots to resize, top dot to rotate. Shift = circle / 15-degree steps. Wheel = size, Shift+wheel = rotate.");
 }
 static void mask_section(Layer *L, int x, int *py, int w) {
 	if (!maskable(L->tool)) return;
@@ -756,9 +794,23 @@ static void panel_tool(int x, int y, int w, int h) {
 		hint_text(x, &py, w, "Click (or drag) over blemishes and dust spots. Wheel changes the size.");
 		break;
 	case T_VIGNETTE:
+		generic_params(L, x, &py, w);
+		hint_text(x, &py, w, "Drag on the photo to move the centre. Wheel changes the size.");
+		break;
 	case T_LENS:
 		generic_params(L, x, &py, w);
-		hint_text(x, &py, w, "Drag on the photo to move the centre.");
+		if (button(4940, x, py, (w - 5) / 2, 24, "Circle", BS_NORMAL, 0)) {
+			float r = sqrtf(L->arx * L->ary);
+			L->arx = L->ary = r;
+			L->arot = 0.f;
+			touch(L);
+		}
+		if (button(4941, x + (w - 5) / 2 + 5, py, (w - 5) / 2, 24, "Reset area", BS_NORMAL, 0)) {
+			area_reset(L);
+			touch(L);
+		}
+		py += 32;
+		hint_text(x, &py, w, "Drag inside to move. Drag the edge dots to resize, the top dot to rotate. Hold Shift for a perfect circle (or 15-degree steps). Wheel = size, Shift+wheel = rotate. Touch: pinch and twist.");
 		break;
 	case T_GRAD:
 		generic_params(L, x, &py, w);
@@ -816,6 +868,7 @@ static void panel_tool(int x, int y, int w, int h) {
 		if (L->tool != T_PERSP && L->tool != T_PORTRAIT && L->tool != T_FRAME) hint_text(x, &py, w, "Tip: drag up/down on the photo to pick a parameter, left/right to change it.");
 		break;
 	}
+	area_section(L, x, &py, w);
 	mask_section(L, x, &py, w);
 	panel_content = py - content_start + 8;
 	clip_set(c0);

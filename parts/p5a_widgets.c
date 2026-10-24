@@ -5,6 +5,7 @@ static int mdx = 0, mdy = 0;            /* mouse delta since last frame */
 static int m_down[3], m_press[3], m_rel[3];
 static int m_dbl = 0, wheel = 0, wheel_used = 0;
 static int mod_shift = 0, mod_ctrl = 0, mod_alt = 0;
+static float gest_dist = 0.f, gest_theta = 0.f; /* two-finger pinch / twist this frame */
 static int act_id = 0;                  /* widget currently being dragged */
 static int modal = 0, in_modal_draw = 0;
 static int quit_flag = 0, dirty = 1;
@@ -342,31 +343,54 @@ static void canvas_job(void *v, int ya, int yb) {
 	float lsc = 1.f / (float)(1 << lev);
 	const uint32_t *px = m->px[lev];
 	int nearest_ = c->zoom >= 5.f;
+	/* per-column sample positions are the same for every row: compute them once per job */
+	int cw = c->w;
+	int *cx0 = (int *)xmalloc(sizeof(int) * 3 * (size_t)cw), *cx1 = cx0 + cw, *cax = cx1 + cw;
+	for (int x = 0; x < cw; x++) {
+		float ix = (c->cx + (x + 0.5f - cw * 0.5f) / c->zoom) * lsc;
+		if (ix < 0 || ix >= W) {
+			cx0[x] = -1;
+			continue;
+		}
+		if (nearest_) {
+			cx0[x] = (int)ix;
+			continue;
+		}
+		float fx = ix - 0.5f;
+		int x0 = (int)floorf(fx);
+		cax[x] = (int)((fx - x0) * 256.f);
+		cx1[x] = MIN(x0 + 1, W - 1);
+		cx0[x] = MAX(x0, 0);
+	}
 	for (int y = ya; y < yb; y++) {
 		uint32_t *d = &fb[(size_t)(c->y0 + y) * FW + c->x0];
 		float iy = (c->cy + (y + 0.5f - c->h * 0.5f) / c->zoom) * lsc;
 		if (iy < 0 || iy >= H) continue;
-		for (int x = 0; x < c->w; x++) {
-			float ix = (c->cx + (x + 0.5f - c->w * 0.5f) / c->zoom) * lsc;
-			if (ix < 0 || ix >= W) continue;
-			if (nearest_) {
-				d[x] = px[(size_t)(int)iy * W + (int)ix];
-				continue;
-			}
-			float fx = ix - 0.5f, fy = iy - 0.5f;
-			int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
-			int ax = (int)((fx - x0) * 256.f), ay = (int)((fy - y0) * 256.f);
-			int x1 = MIN(x0 + 1, W - 1), y1 = MIN(y0 + 1, H - 1);
-			x0 = MAX(x0, 0);
-			y0 = MAX(y0, 0);
-			uint32_t p00 = px[(size_t)y0 * W + x0], p10 = px[(size_t)y0 * W + x1], p01 = px[(size_t)y1 * W + x0], p11 = px[(size_t)y1 * W + x1];
-			uint32_t t0 = blend_px(p00, p10, ax), t1 = blend_px(p01, p11, ax);
+		if (nearest_) {
+			const uint32_t *r = px + (size_t)(int)iy * W;
+			for (int x = 0; x < cw; x++)
+				if (cx0[x] >= 0) d[x] = r[cx0[x]];
+			continue;
+		}
+		float fy = iy - 0.5f;
+		int y0 = (int)floorf(fy);
+		int ay = (int)((fy - y0) * 256.f);
+		int y1 = MIN(y0 + 1, H - 1);
+		y0 = MAX(y0, 0);
+		const uint32_t *r0 = px + (size_t)y0 * W, *r1 = px + (size_t)y1 * W;
+		for (int x = 0; x < cw; x++) {
+			int xa = cx0[x];
+			if (xa < 0) continue;
+			int xb = cx1[x], ax = cax[x];
+			uint32_t t0 = blend_px(r0[xa], r0[xb], ax), t1 = blend_px(r1[xa], r1[xb], ax);
 			d[x] = blend_px(t0, t1, ay);
 		}
 	}
+	free(cx0);
 }
 static void draw_mips(const Mips *m, int x0, int y0, int w, int h, float cx, float cy, float z) {
 	if (!m->n) return;
+	if (ui_dry) return;
 	DrawCtx c = {m, x0, y0, w, h, cx, cy, z};
 	Clip o = clip_push(x0, y0, w, h);
 	/* only rows/cols inside the clip are valid; canvas rect is always inside fb */
